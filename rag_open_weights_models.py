@@ -27,9 +27,10 @@ EMBED_MODEL     = "nomic-embed-text"
 DOCS_DIR        = "./docs"
 CHROMA_DIR      = "./chroma_store"
 COLLECTION      = "rag_knowledge"
-CHUNK_SIZE      = 500
-CHUNK_OVERLAP   = 50
-TOP_K           = 3
+CHUNK_SIZE      = 1000
+CHUNK_OVERLAP   = 150
+TOP_K           = 5
+SCORE_THRESHOLD  = 0.40
 
 # ─── OLLAMA EMBEDDINGS ──────────────────────────────────────────────────────
 def ollama_embed(texts: list[str]) -> list[list[float]]:
