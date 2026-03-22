@@ -317,3 +317,9 @@ The final step is to invoke the Ollama binary to "create" the model from your Mo
 
 ## Plan B for Llama3.2  
 If your image from which your container runs doesnt contain any model (Llama3.2 in this case), then you can use what is stated above to get a distilled Llama3.2 model from HuggingFace :-) and side-load it to your container.
+
+## How to improve the results. 
+
+- in general, longer chunks mean better understanding of the context
+- while longer overlaps mean fewer broken sentences
+- switch to sentence-aware chunking (structural fix)
