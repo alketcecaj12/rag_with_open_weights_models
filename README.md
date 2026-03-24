@@ -30,9 +30,9 @@ disclosure standards.
 ┌─────────────────────────────────────────────────────────────────────┐
 │  INDEXING  (runs once, then cached)                                 │
 │                                                                     │
-│  PDF / TXT file  ──►  pypdf loader  ──►  char-level chunker        │
-│                        (500 chars,        (chunk_size=500,          │
-│                         50 overlap)        overlap=50)              │
+│  PDF / TXT file  ──►  pypdf loader     ──►  sentence-aware chunker │
+│                        (page-by-page)        (chunk_size=1000,      │
+│                                               overlap=150)          │
 │                              │                                      │
 │                              ▼                                      │
 │                   nomic-embed-text (Ollama)                         │
@@ -41,30 +41,35 @@ disclosure standards.
 │                              ▼                                      │
 │                   ChromaDB  (cosine similarity,                     │
 │                    persisted to ./chroma_store)                     │
+│                    metadata: source, page number, chunk index       │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
 │  QUERY  (runs on every question)                                    │
 │                                                                     │
-│  User question  ──►  nomic-embed-text  ──►  ChromaDB top-3 chunks  │
+│  User question  ──►  nomic-embed-text  ──►  ChromaDB top-5 chunks  │
+│                                              (score ≥ 0.40)         │
 │                                                    │                │
 │                                                    ▼                │
 │                              Prompt = context + question            │
+│                              (context includes page numbers)        │
 │                                                    │                │
 │                                                    ▼                │
 │                              llama3.2 (Ollama)  ──►  Answer        │
+│                                                  + page citation    │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key configuration values
 
-| Parameter      | Value  | Effect                                           |
-|----------------|--------|--------------------------------------------------|
-| `CHUNK_SIZE`   | 500    | Characters per chunk (balance recall vs. noise)  |
-| `CHUNK_OVERLAP`| 50     | Overlap prevents cutting sentences at boundaries |
-| `TOP_K`        | 3      | How many chunks are injected into the prompt     |
-| `GEN_MODEL`    | llama3.2 | 4-bit quantised generation model              |
-| `EMBED_MODEL`  | nomic-embed-text | 4-bit quantised embedding model      |
+| Parameter         | Value            | Effect                                                    |
+|-------------------|------------------|-----------------------------------------------------------|
+| `CHUNK_SIZE`      | 1000             | Characters per chunk (was 500)                            |
+| `CHUNK_OVERLAP`   | 150              | Overlap prevents cutting sentences at boundaries (was 50) |
+| `TOP_K`           | 5                | How many chunks are injected into the prompt (was 3)      |
+| `SCORE_THRESHOLD` | 0.40             | Minimum cosine similarity — low-quality chunks filtered out |
+| `GEN_MODEL`       | llama3.2         | 4-bit quantised generation model                          |
+| `EMBED_MODEL`     | nomic-embed-text | 4-bit quantised embedding model                           |
 
 ---
 
@@ -78,7 +83,10 @@ ollama pull llama3.2
 ollama pull nomic-embed-text
 
 # 2. Install Python dependencies
-pip install chromadb pypdf
+pip install chromadb pypdf nltk
+
+# 3. Download NLTK sentence tokenizer data (run once)
+python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
 ```
 
 ### Docker / Ollama URL
@@ -117,15 +125,22 @@ The first run embeds all chunks and writes them to `./chroma_store/`.
 This is the slow step — a 1 982-page document will produce thousands of
 chunks. Subsequent runs skip re-embedding and load instantly.
 
+> **Note:** If you previously ran an older version of this script,
+> delete `./chroma_store/` before running again — chunk IDs have changed
+> due to the page-level chunking structure.
+> ```bash
+> rm -rf ./chroma_store
+> ```
+
 ### Expected first-run output
 
 ```
-=== RAG v2 (Ollama-only) ===
+=== RAG (Ollama-only, with page citations) ===
 
 [1/3] Loading documents from './docs'...
-  Loaded: BaselFramework_.pdf (XXXXXX chars)
+  Loaded: BaselFramework_.pdf (1982 pages, XXXXXX chars)
 
-[2/3] Chunking (500 chars, 50 overlap)...
+[2/3] Chunking (1000 chars max, 150 overlap, sentence-aware)...
   Total chunks: XXXX
 
 [3/3] Indexing into ChromaDB at './chroma_store'...
@@ -135,6 +150,24 @@ chunks. Subsequent runs skip re-embedding and load instantly.
 
 === Ready! Ask questions about your documents. ('quit' to exit) ===
 You:
+```
+
+### Example output with page citations
+
+```
+You: What is the definition of a Global Systemically Important Bank (G-SIB)?
+
+  [Retrieved]
+    1. score=0.812 [BaselFramework_.pdf p.17] A G-SIB is defined as a bank...
+    2. score=0.754 [BaselFramework_.pdf p.18] The assessment methodology...
+    3. score=0.701 [BaselFramework_.pdf p.19] G-SIBs are subject to...
+
+RAG: A Global Systemically Important Bank (G-SIB) is a bank whose distress
+or failure would cause significant disruption to the broader financial system
+and economic activity at large. Assessment is based on five categories: size,
+interconnectedness, substitutability, complexity, and cross-border activity.
+
+Source: BaselFramework_.pdf, Page 17
 ```
 
 ---
@@ -256,21 +289,24 @@ What supervisory review principles apply to interest rate risk in the banking bo
 | Signal | What it means |
 |--------|---------------|
 | Answer matches the document text | Retrieval and generation are working correctly |
+| Page citation present in answer | Page-level chunking is working correctly |
 | Score in `[Retrieved]` close to 1.0 | High cosine similarity — chunks are relevant |
-| Score below ~0.5 | Weak retrieval — consider reducing `CHUNK_SIZE` or increasing `TOP_K` |
+| Score below ~0.5 (chunk filtered out) | `SCORE_THRESHOLD` caught a bad match — working as intended |
 | "I don't know" on Category E questions | Grounding is working; model is not hallucinating |
 | Answer on Category E questions | Hallucination — the model ignored the prompt constraint |
 | Truncated or partial answers | Chunk boundaries cut the answer; try increasing `CHUNK_SIZE` |
 | Wrong answer despite relevant chunks | Generation model size limitation; llama3.2 is small |
+| "No relevant information found" message | All chunks scored below `SCORE_THRESHOLD` — try rephrasing |
 
 ### Suggested tuning experiments
 
 ```python
 # In rag_open_weights_models.py — try these combinations:
 
-CHUNK_SIZE    = 800    # Larger chunks = more context per retrieval
-CHUNK_OVERLAP = 100   # More overlap = fewer broken sentences
-TOP_K         = 5     # More chunks = richer context, but longer prompts
+CHUNK_SIZE      = 1200  # Even larger chunks for very dense regulatory text
+CHUNK_OVERLAP   = 200   # More overlap = fewer broken definitions
+TOP_K           = 7     # More chunks = richer context, but longer prompts
+SCORE_THRESHOLD = 0.35  # Lower threshold if too many "not found" responses
 ```
 
 ---
@@ -283,7 +319,7 @@ project/
 ├── docs/
 │   └── BaselFramework_.pdf      # Source document (1982 pages)
 ├── chroma_store/                # Auto-created — persisted vector index
-│   └── ...
+│   └── ...                      # Chunks include page number metadata
 └── README.md                    # This file
 ```
 
@@ -291,35 +327,43 @@ project/
 
 ## Dependencies
 
-| Package    | Purpose                          |
-|------------|----------------------------------|
-| `chromadb` | Vector store (local, persistent) |
-| `pypdf`    | PDF text extraction              |
-| `requests` | Ollama API calls                 |
-| `ollama`   | llama3.2 + nomic-embed-text      |
+| Package    | Purpose                                      |
+|------------|----------------------------------------------|
+| `chromadb` | Vector store (local, persistent)             |
+| `pypdf`    | PDF text extraction (page-by-page)           |
+| `nltk`     | Sentence tokenizer for sentence-aware chunks |
+| `requests` | Ollama API calls                             |
+| `ollama`   | llama3.2 + nomic-embed-text                  |
 
+---
 
---------------------------------------------------------
-
-## Side loading the models from HuggingFace 
+## Side loading the models from HuggingFace
 
 For nomic-embed-text, this typically requires a GGUF (GPT-Generated Unified Format) file. You can download the quantized GGUF version of Nomic Embed from reputable community repositories such as Hugging Face (huggingface.co). Utilizing a quantized format like Q4_K_M is often recommended for local deployment as it significantly reduces memory pressure while maintaining the model's 8192-token context window and high retrieval accuracy (Yadav et al., 6 Dec 2025).
 
 Once the .gguf file is downloaded to your Windows host (e.g., in C:\Users\UserName\Downloads\nomic-embed-text.gguf), you must transfer it into the running Docker container. Use the docker cp command to move the file into a temporary directory within my_container. For example: docker cp C:\Users\UserName\Downloads\nomic-embed-text.gguf my_container:/tmp/nomic-embed-text.gguf. This ensures the weights are physically present within the container's isolated storage before the registration process begins.
 
 ## Creating the Local Modelfile
+
 Ollama identifies and configures models through a manifest known as a Modelfile. To register your side-loaded weights, you must create a plain text file inside the container that points to the GGUF file you just uploaded. You can create this file using a simple redirected echo command: docker exec -it my_container sh -c "echo 'FROM /tmp/nomic-embed-text.gguf' > /tmp/Modelfile". This FROM instruction is the fundamental directive that binds the raw weights to a named model entity within the Ollama service.
 
 For embedding models, it is often beneficial to specify additional parameters within the Modelfile to optimize performance. Although Nomic Embed is highly efficient, you can add lines such as PARAMETER num_ctx 8192 to explicitly define the context window length. This aligns the local runtime with the model's architectural capabilities, which have been shown to outperform proprietary long-context embedders on benchmarks like LoCo and MTEB (Nussbaum et al., 2024).
 
 ## Finalizing Registration and Verification
+
 The final step is to invoke the Ollama binary to "create" the model from your Modelfile. Run the command: docker exec -it my_container ollama create nomic-embed-text -f /tmp/Modelfile. This command processes the GGUF file, generates the necessary metadata, and adds nomic-embed-text to the local library. Unlike the pull command, this operation is entirely offline and local to the container's filesystem, making it immune to the DNS and I/O timeout errors previously encountered.
 
-## Plan B for Llama3.2  
-If your image from which your container runs doesnt contain any model (Llama3.2 in this case), then you can use what is stated above to get a distilled Llama3.2 model from HuggingFace :-) and side-load it to your container.
+## Plan B for Llama3.2
 
-## How to improve the results. 
+If your image from which your container runs doesn't contain any model (Llama3.2 in this case), then you can use what is stated above to get a distilled Llama3.2 model from HuggingFace and side-load it to your container.
 
-- in general, longer chunks mean better understanding of the context
-- while longer overlaps mean fewer broken sentences
-- switch to sentence-aware chunking (structural fix)
+---
+
+## How to improve the results
+
+- In general, longer chunks mean better understanding of the context
+- Wider overlaps mean fewer broken sentences at chunk boundaries
+- Sentence-aware chunking (now the default) prevents definitions being cut mid-sentence
+- Increasing `TOP_K` retrieves more candidate chunks, reducing near-miss failures
+- The `SCORE_THRESHOLD` filters out low-quality matches before they pollute the prompt
+- Page-level chunking ensures every chunk carries a precise page citation — critical for large documents like the Basel Framework (1 982 pages)
