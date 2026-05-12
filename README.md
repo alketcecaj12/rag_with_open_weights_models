@@ -1,7 +1,7 @@
 # RAG with Open-Weight Models — Local, 100% Offline
 
 A fully local Retrieval-Augmented Generation (RAG) pipeline using
-**Llama 3.2** for generation and **nomic-embed-text** for embeddings,
+**Llama 3.2** for generation and **mxbai-embed-large** for embeddings,
 both running inside an **Ollama** Docker container. No OpenAI key, no
 internet required at inference time.
 
@@ -35,7 +35,7 @@ disclosure standards.
 │                                               overlap=150)          │
 │                              │                                      │
 │                              ▼                                      │
-│                   nomic-embed-text (Ollama)                         │
+│                   mxbai-embed-large (Ollama)                        │
 │                    local embedding model                            │
 │                              │                                      │
 │                              ▼                                      │
@@ -47,29 +47,35 @@ disclosure standards.
 ┌─────────────────────────────────────────────────────────────────────┐
 │  QUERY  (runs on every question)                                    │
 │                                                                     │
-│  User question  ──►  nomic-embed-text  ──►  ChromaDB top-5 chunks  │
-│                                              (score ≥ 0.40)         │
-│                                                    │                │
-│                                                    ▼                │
-│                              Prompt = context + question            │
-│                              (context includes page numbers)        │
-│                                                    │                │
-│                                                    ▼                │
-│                              llama3.2 (Ollama)  ──►  Answer        │
-│                                                  + page citation    │
+│  User question  ──►  mxbai-embed-large  ──►  ChromaDB top-5 chunks │
+│                                              (semantic, score≥0.40) │
+│                                +                                    │
+│                              BM25 top-5 chunks (lexical)            │
+│                                │                                    │
+│                                ▼                                    │
+│                    Reciprocal Rank Fusion (RRF)                     │
+│                    → merged top-5 hybrid results                    │
+│                                │                                    │
+│                                ▼                                    │
+│                    Prompt = context + question                      │
+│                    (context includes page numbers)                  │
+│                                │                                    │
+│                                ▼                                    │
+│                    llama3.2 (Ollama)  ──►  Answer + page citation   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key configuration values
 
-| Parameter         | Value            | Effect                                                    |
-|-------------------|------------------|-----------------------------------------------------------|
-| `CHUNK_SIZE`      | 1000             | Characters per chunk (was 500)                            |
-| `CHUNK_OVERLAP`   | 150              | Overlap prevents cutting sentences at boundaries (was 50) |
-| `TOP_K`           | 5                | How many chunks are injected into the prompt (was 3)      |
-| `SCORE_THRESHOLD` | 0.40             | Minimum cosine similarity — low-quality chunks filtered out |
-| `GEN_MODEL`       | llama3.2         | 4-bit quantised generation model                          |
-| `EMBED_MODEL`     | nomic-embed-text | 4-bit quantised embedding model                           |
+| Parameter | Value | Effect |
+|---|---|---|
+| `CHUNK_SIZE` | 1000 | Characters per chunk |
+| `CHUNK_OVERLAP` | 150 | Overlap prevents cutting sentences at boundaries |
+| `TOP_K` | 5 | Chunks injected into the prompt (both semantic and BM25) |
+| `SCORE_THRESHOLD` | 0.40 | Minimum cosine similarity — low-quality chunks filtered out |
+| `RRF_K` | 60 | Reciprocal Rank Fusion constant |
+| `GEN_MODEL` | llama3.2 | 4-bit quantised generation model |
+| `EMBED_MODEL` | mxbai-embed-large | 4-bit quantised embedding model |
 
 ---
 
@@ -80,10 +86,10 @@ disclosure standards.
 ```bash
 # 1. Pull models inside your Ollama Docker container
 ollama pull llama3.2
-ollama pull nomic-embed-text
+ollama pull mxbai-embed-large
 
 # 2. Install Python dependencies
-pip install chromadb pypdf nltk
+pip install chromadb pypdf nltk rank_bm25 requests openpyxl
 
 # 3. Download NLTK sentence tokenizer data (run once)
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
@@ -107,12 +113,6 @@ docker inspect <ollama_container_name> | grep '"IPAddress"'
 export OLLAMA_URL="http://<container_ip>:11434"
 ```
 
-Then update the constant at the top of `rag_open_weights_models.py`:
-
-```python
-OLLAMA_URL = "http://host.docker.internal:11434"   # <- whichever resolves
-```
-
 ### First run (indexing)
 
 ```bash
@@ -122,248 +122,259 @@ python rag_open_weights_models.py
 ```
 
 The first run embeds all chunks and writes them to `./chroma_store/`.
-This is the slow step — a 1 982-page document will produce thousands of
-chunks. Subsequent runs skip re-embedding and load instantly.
+Subsequent runs load the store instantly.
 
-> **Note:** If you previously ran an older version of this script,
-> delete `./chroma_store/` before running again — chunk IDs have changed
-> due to the page-level chunking structure.
+> **Note:** If you previously ran an older version with `nomic-embed-text`,
+> delete `./chroma_store/` before switching to `mxbai-embed-large`:
 > ```bash
 > rm -rf ./chroma_store
 > ```
-
-### Expected first-run output
-
-```
-=== RAG (Ollama-only, with page citations) ===
-
-[1/3] Loading documents from './docs'...
-  Loaded: BaselFramework_.pdf (1982 pages, XXXXXX chars)
-
-[2/3] Chunking (1000 chars max, 150 overlap, sentence-aware)...
-  Total chunks: XXXX
-
-[3/3] Indexing into ChromaDB at './chroma_store'...
-  Embedding XXXX new chunks via Ollama...
-  ...
-  Done. XXXX chunks indexed.
-
-=== Ready! Ask questions about your documents. ('quit' to exit) ===
-You:
-```
-
-### Example output with page citations
-
-```
-You: What is the definition of a Global Systemically Important Bank (G-SIB)?
-
-  [Retrieved]
-    1. score=0.812 [BaselFramework_.pdf p.17] A G-SIB is defined as a bank...
-    2. score=0.754 [BaselFramework_.pdf p.18] The assessment methodology...
-    3. score=0.701 [BaselFramework_.pdf p.19] G-SIBs are subject to...
-
-RAG: A Global Systemically Important Bank (G-SIB) is a bank whose distress
-or failure would cause significant disruption to the broader financial system
-and economic activity at large. Assessment is based on five categories: size,
-interconnectedness, substitutability, complexity, and cross-border activity.
-
-Source: BaselFramework_.pdf, Page 17
-```
 
 ---
 
 ## 4. Analysis — Test Questions for the Basel Framework
 
-The Basel Framework spans many regulatory domains. The questions below
-are grouped by topic and by cognitive difficulty, so you can
-systematically test retrieval quality from shallow factual recall to
-deep multi-concept reasoning.
+The questions below are grouped by topic and cognitive difficulty,
+so you can systematically test retrieval quality from shallow factual
+recall to deep multi-concept reasoning.
 
----
-
-### Category A — Factual / Definition questions
-> Test: Can the RAG retrieve a single precise definition?
+### Category A — Factual / Definition
 
 ```
 What is Tier 1 capital?
-
 What is the definition of a Global Systemically Important Bank (G-SIB)?
-
 What does LCR stand for, and what is its minimum requirement?
-
 How does the Basel Framework define a trading book?
-
 What is the Net Stable Funding Ratio (NSFR)?
-
-What is a credit conversion factor (CCF)?
 ```
 
----
-
-### Category B — Numerical / Threshold questions
-> Test: Can the RAG retrieve specific numbers buried in regulatory text?
+### Category B — Numerical / Threshold
 
 ```
 What is the minimum Common Equity Tier 1 (CET1) ratio under Basel III?
-
 What is the capital conservation buffer requirement?
-
 What leverage ratio must G-SIBs maintain?
-
-What haircut applies to Level 1 HQLA assets under the LCR?
-
 What is the large exposure limit as a percentage of Tier 1 capital?
 ```
 
----
-
-### Category C — Process / How-to questions
-> Test: Can the RAG reconstruct a multi-step regulatory procedure?
+### Category C — Process / How-to
 
 ```
-How is Risk-Weighted Assets (RWA) calculated under the Standardised Approach for credit risk?
-
 How does a bank calculate its Liquidity Coverage Ratio?
-
-What are the steps to qualify for the IRB approach?
-
-How is the leverage ratio exposure measure calculated?
-
+How is Risk-Weighted Assets (RWA) calculated under the Standardised Approach?
 How are securitisation exposures treated under the Standardised Approach?
+How is the leverage ratio exposure measure calculated?
 ```
 
----
-
-### Category D — Comparative questions
-> Test: Can the RAG surface distinctions between related concepts?
+### Category D — Comparative
 
 ```
 What is the difference between the Standardised Approach and the IRB approach for credit risk?
-
-How does the banking book differ from the trading book?
-
 What distinguishes Tier 1 capital from Tier 2 capital?
-
 What is the difference between the LCR and the NSFR?
-
-How does the treatment of G-SIBs differ from D-SIBs?
 ```
 
----
-
-### Category E — Edge case / Out-of-scope questions
-> Test: Does the RAG correctly say "I don't know" when the answer is absent?
+### Category E — Out-of-scope (grounding test)
 
 ```
 What is the current ECB interest rate?
-
 Who is the current Chair of the Federal Reserve?
-
 What does IFRS 9 say about expected credit loss provisioning?
 ```
 
-These questions are deliberately **outside the document**. A
-well-functioning RAG should return *"I don't know"* rather than
-hallucinate, because the prompt instructs: *"If the answer is not in
-the context, say 'I don't know'."*
+These are deliberately **outside the document**. A well-functioning RAG
+should return "I don't know" rather than hallucinate.
 
----
-
-### Category F — Advanced / Multi-hop questions
-> Test: Can the RAG chain concepts across retrieved chunks?
+### Category F — Advanced / Multi-hop
 
 ```
-How does a bank's CET1 ratio affect its eligibility to pay dividends under the capital conservation buffer rules?
+How does a bank's CET1 ratio affect its eligibility to pay dividends
+under the capital conservation buffer rules?
 
-Under what conditions can a bank use internal models for market risk, and what backtesting requirements apply?
+How are cryptoasset exposures classified and what capital treatment
+do they receive?
 
-How are cryptoasset exposures classified and what capital treatment do they receive?
-
-What supervisory review principles apply to interest rate risk in the banking book (IRRBB)?
+What supervisory review principles apply to interest rate risk
+in the banking book (IRRBB)?
 ```
 
 ---
 
-## 5. Conclusion — What to look for when evaluating responses
+## 5. Conclusion — Evaluation Frameworks
 
-| Signal | What it means |
-|--------|---------------|
-| Answer matches the document text | Retrieval and generation are working correctly |
-| Page citation present in answer | Page-level chunking is working correctly |
-| Score in `[Retrieved]` close to 1.0 | High cosine similarity — chunks are relevant |
-| Score below ~0.5 (chunk filtered out) | `SCORE_THRESHOLD` caught a bad match — working as intended |
-| "I don't know" on Category E questions | Grounding is working; model is not hallucinating |
-| Answer on Category E questions | Hallucination — the model ignored the prompt constraint |
-| Truncated or partial answers | Chunk boundaries cut the answer; try increasing `CHUNK_SIZE` |
-| Wrong answer despite relevant chunks | Generation model size limitation; llama3.2 is small |
-| "No relevant information found" message | All chunks scored below `SCORE_THRESHOLD` — try rephrasing |
+This project supports **two evaluation frameworks**, both running
+fully locally via Ollama with no external API key required.
+They use the same ground truth dataset so their scores can be
+compared directly.
+
+---
+
+### Framework 1 — RAGAS (`rag_evaluate.py`)
+
+RAGAS evaluates the RAG pipeline along two axes: retrieval quality
+and generation quality.
+
+#### Install
+
+```bash
+pip install ragas chromadb pypdf nltk rank_bm25 openpyxl requests
+```
+
+#### Run
+
+```bash
+python rag_evaluate.py
+# Output: rag_eval_report_<timestamp>.xlsx
+```
+
+#### Metrics
+
+| Metric | Layer | What it measures |
+|---|---|---|
+| Context Precision | Retriever | Of the retrieved chunks, what fraction were relevant? (PRECISION) |
+| Context Recall | Retriever | How much of the correct answer was present in the chunks? (RECALL) |
+| Faithfulness | Generator | Are the answer's claims grounded in the retrieved context? |
+| Answer Relevancy | Generator | Does the answer actually address the question? |
+| Page Accuracy | Retriever | Did the retriever find a chunk from the correct page? (deterministic) |
+
+RAGAS uses free-form LLM prompts and parses a numeric score from the
+response. It does **not** produce a natural-language reason for each score.
+
+---
+
+### Framework 2 — DeepEval (`rag_evaluate_deepeval.py`)
+
+DeepEval uses Pydantic-validated structured LLM-judge calls, making
+scores more deterministic than RAGAS. Its key unique feature is a
+**natural-language reason** for every score — useful for debugging
+specific retrieval or generation failures.
+
+#### Install
+
+```bash
+pip install deepeval chromadb pypdf nltk rank_bm25 openpyxl requests
+
+# Point DeepEval at your local Ollama (no OpenAI key needed)
+deepeval set-ollama --model=llama3.2 --base-url="http://localhost:11434"
+```
+
+#### Run
+
+```bash
+python rag_evaluate_deepeval.py
+# Output: deepeval_report_<timestamp>.xlsx
+```
+
+#### Metrics
+
+| Metric | Layer | What it measures | Direction |
+|---|---|---|---|
+| FaithfulnessMetric | Generator | Does the answer contradict the retrieved context? | ↑ higher = better |
+| AnswerRelevancyMetric | Generator | Does the answer address the question? | ↑ higher = better |
+| ContextualPrecisionMetric | Retriever | Are relevant chunks ranked higher than noise? | ↑ higher = better |
+| ContextualRecallMetric | Retriever | Does the context cover the expected answer? | ↑ higher = better |
+| HallucinationMetric | End-to-end | What fraction of claims are unsupported by context? | ↓ **lower = better** |
+| Page Accuracy | Retriever | Deterministic page-hit check (same as RAGAS version) | ↑ higher = better |
+
+#### Report sheets
+
+The DeepEval Excel report has an extra **"Reasons" sheet** not present
+in the RAGAS report. It contains the LLM judge's plain-English
+explanation for every score on every question — the primary tool for
+diagnosing failures.
+
+---
+
+### Framework comparison
+
+| | RAGAS | DeepEval |
+|---|---|---|
+| Judge mechanism | Free-text LLM prompt → parse number | Pydantic JSON → typed score |
+| Reason per score | ❌ | ✅ (Reasons sheet) |
+| Hallucination metric | Faithfulness (proxy) | Dedicated `HallucinationMetric` |
+| Contextual Precision | Relevance count / total retrieved | Ranking-aware (penalises noise above signal) |
+| Requires OpenAI | No (Ollama judge) | No (Ollama judge via `OllamaModel`) |
+| Output | `rag_eval_report_*.xlsx` | `deepeval_report_*.xlsx` |
+
+Both scripts use the **same 16-question ground truth dataset** and the
+same hybrid RAG pipeline, so scores are directly comparable.
+
+---
+
+### Score interpretation guide
+
+| Score | Label | Meaning |
+|---|---|---|
+| ≥ 0.75 | Good | System is performing well on this metric |
+| 0.40–0.74 | Fair | Acceptable but investigate individual failures |
+| < 0.40 | Poor | Systematic issue — check `CHUNK_SIZE`, `TOP_K`, or embedding model |
+
+> For `HallucinationMetric` (DeepEval only), invert this:
+> score < 0.25 is good, score > 0.50 is a systematic problem.
+
+---
 
 ### Suggested tuning experiments
 
 ```python
 # In rag_open_weights_models.py — try these combinations:
-
-CHUNK_SIZE      = 1200  # Even larger chunks for very dense regulatory text
+CHUNK_SIZE      = 1200  # Larger chunks for dense regulatory text
 CHUNK_OVERLAP   = 200   # More overlap = fewer broken definitions
-TOP_K           = 7     # More chunks = richer context, but longer prompts
-SCORE_THRESHOLD = 0.35  # Lower threshold if too many "not found" responses
+TOP_K           = 7     # More chunks = richer context
+SCORE_THRESHOLD = 0.35  # Lower if too many "not found" responses
 ```
 
 ---
 
-## File structure after first run
+## File structure
 
 ```
 project/
-├── rag_open_weights_models.py   # Main script
+├── rag_open_weights_models.py     # Main RAG script
+├── rag_evaluate.py                # Evaluation: RAGAS metrics
+├── rag_evaluate_deepeval.py       # Evaluation: DeepEval metrics
 ├── docs/
-│   └── BaselFramework_.pdf      # Source document (1982 pages)
-├── chroma_store/                # Auto-created — persisted vector index
-│   └── ...                      # Chunks include page number metadata
-└── README.md                    # This file
+│   └── BaselFramework_.pdf        # Source document (1982 pages)
+├── chroma_store/                  # Auto-created — persisted vector index
+└── README.md                      # This file
 ```
 
 ---
 
 ## Dependencies
 
-| Package    | Purpose                                      |
-|------------|----------------------------------------------|
-| `chromadb` | Vector store (local, persistent)             |
-| `pypdf`    | PDF text extraction (page-by-page)           |
-| `nltk`     | Sentence tokenizer for sentence-aware chunks |
-| `requests` | Ollama API calls                             |
-| `ollama`   | llama3.2 + nomic-embed-text                  |
+| Package | Purpose |
+|---|---|
+| `chromadb` | Vector store (local, persistent) |
+| `pypdf` | PDF text extraction (page-by-page) |
+| `nltk` | Sentence tokenizer for sentence-aware chunks |
+| `rank_bm25` | BM25 lexical retrieval for hybrid search |
+| `requests` | Ollama API calls |
+| `openpyxl` | Excel report generation |
+| `ragas` | RAGAS evaluation framework |
+| `deepeval` | DeepEval evaluation framework |
+| `ollama` | llama3.2 + mxbai-embed-large |
 
 ---
 
-## Side loading the models from HuggingFace
+## Side-loading models from HuggingFace
 
-For nomic-embed-text, this typically requires a GGUF (GPT-Generated Unified Format) file. You can download the quantized GGUF version of Nomic Embed from reputable community repositories such as Hugging Face (huggingface.co). Utilizing a quantized format like Q4_K_M is often recommended for local deployment as it significantly reduces memory pressure while maintaining the model's 8192-token context window and high retrieval accuracy (Yadav et al., 6 Dec 2025).
+If your Ollama container has no internet access, download GGUF weights
+from HuggingFace on another machine and transfer them via USB.
 
-Once the .gguf file is downloaded to your Windows host (e.g., in C:\Users\UserName\Downloads\nomic-embed-text.gguf), you must transfer it into the running Docker container. Use the docker cp command to move the file into a temporary directory within my_container. For example: docker cp C:\Users\UserName\Downloads\nomic-embed-text.gguf my_container:/tmp/nomic-embed-text.gguf. This ensures the weights are physically present within the container's isolated storage before the registration process begins.
+```bash
+# Copy the GGUF file into the running container
+docker cp /path/to/model.gguf my_container:/tmp/model.gguf
 
-## Creating the Local Modelfile
+# Create a Modelfile inside the container
+docker exec -it my_container sh -c "echo 'FROM /tmp/model.gguf' > /tmp/Modelfile"
 
-Ollama identifies and configures models through a manifest known as a Modelfile. To register your side-loaded weights, you must create a plain text file inside the container that points to the GGUF file you just uploaded. You can create this file using a simple redirected echo command: docker exec -it my_container sh -c "echo 'FROM /tmp/nomic-embed-text.gguf' > /tmp/Modelfile". This FROM instruction is the fundamental directive that binds the raw weights to a named model entity within the Ollama service.
+# Register with Ollama
+docker exec -it my_container ollama create my-model -f /tmp/Modelfile
 
-For embedding models, it is often beneficial to specify additional parameters within the Modelfile to optimize performance. Although Nomic Embed is highly efficient, you can add lines such as PARAMETER num_ctx 8192 to explicitly define the context window length. This aligns the local runtime with the model's architectural capabilities, which have been shown to outperform proprietary long-context embedders on benchmarks like LoCo and MTEB (Nussbaum et al., 2024).
+# Verify
+docker exec -it my_container ollama list
+```
 
-## Finalizing Registration and Verification
-
-The final step is to invoke the Ollama binary to "create" the model from your Modelfile. Run the command: docker exec -it my_container ollama create nomic-embed-text -f /tmp/Modelfile. This command processes the GGUF file, generates the necessary metadata, and adds nomic-embed-text to the local library. Unlike the pull command, this operation is entirely offline and local to the container's filesystem, making it immune to the DNS and I/O timeout errors previously encountered.
-
-## Plan B for Llama3.2
-
-If your image from which your container runs doesn't contain any model (Llama3.2 in this case), then you can use what is stated above to get a distilled Llama3.2 model from HuggingFace and side-load it to your container.
-
----
-
-## How to improve the results
-
-- In general, longer chunks mean better understanding of the context
-- Wider overlaps mean fewer broken sentences at chunk boundaries
-- Sentence-aware chunking (now the default) prevents definitions being cut mid-sentence
-- Increasing `TOP_K` retrieves more candidate chunks, reducing near-miss failures
-- The `SCORE_THRESHOLD` filters out low-quality matches before they pollute the prompt
-- Page-level chunking ensures every chunk carries a precise page citation — critical for large documents like the Basel Framework (1 982 pages)
+Recommended quantisation: `Q4_K_M` — good balance of accuracy and
+memory footprint for both `llama3.2` and `mxbai-embed-large`.
