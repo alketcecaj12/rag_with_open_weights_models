@@ -16,30 +16,27 @@
 #
 # DeepEval metrics used (all run locally via OllamaModel — no OpenAI key):
 #
-#  • FaithfulnessMetric        — generator: does the answer contradict the context?
-#  • AnswerRelevancyMetric     — generator: does the answer address the question?
-#  • ContextualPrecisionMetric — retriever: are retrieved chunks ranked usefully?
-#  • ContextualRecallMetric    — retriever: does context cover the ground truth?
-#  • HallucinationMetric       — end-to-end: are claims unsupported by context?
+#  * FaithfulnessMetric        — does the answer contradict the context?
+#  * AnswerRelevancyMetric     — does the answer address the question?
+#  * ContextualPrecisionMetric — are retrieved chunks ranked usefully?
+#  * ContextualRecallMetric    — does context cover the ground truth?
+#  * HallucinationMetric       — are claims unsupported by context? (lower=better)
 #
-# KEY DIFFERENCE vs RAGAS:
-#  DeepEval uses Pydantic-validated LLM-judge calls with structured JSON output,
-#  making scores more deterministic than RAGAS's free-text LLM prompts.
-#  It also provides a human-readable `reason` for every score.
+# NOTE on Ollama API endpoint:
+#   Ollama >= 0.2 deprecated /api/embeddings.
+#   This script uses the new /api/embed endpoint:
+#     - key "prompt"    → "input"
+#     - key "embedding" → "embeddings"[0]
 #
 # Usage:
 #   pip install deepeval chromadb pypdf nltk rank_bm25 openpyxl requests
+#   deepeval set-ollama --model=llama3.2 --base-url="http://localhost:11434"
 #   python rag_evaluate_deepeval.py
 #
 # Output:
 #   deepeval_report_<timestamp>.xlsx
-#
-# Requirements:
-#   Ollama running with llama3.2 and mxbai-embed-large available.
-#   ChromaDB store already indexed (run rag_open_weights_models.py first).
 
 import os
-import re
 import time
 import hashlib
 import requests
@@ -53,8 +50,6 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# DeepEval imports
-from deepeval import evaluate
 from deepeval.models import OllamaModel
 from deepeval.test_case import LLMTestCase
 from deepeval.metrics import (
@@ -68,30 +63,21 @@ from deepeval.metrics import (
 nltk.download("punkt",     quiet=True)
 nltk.download("punkt_tab", quiet=True)
 
-# ─── CONFIG — must match rag_open_weights_models.py ─────────────────────────
+# ─── CONFIG ─────────────────────────────────────────────────────────────────
 
-OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://localhost:11434")
-GEN_MODEL     = "llama3.2"
-EMBED_MODEL   = "mxbai-embed-large"
-DOCS_DIR      = "./docs"
-CHROMA_DIR    = "./chroma_store"
-COLLECTION    = "rag_knowledge"
-CHUNK_SIZE    = 1000
-CHUNK_OVERLAP = 150
-TOP_K         = 5
+OLLAMA_URL      = os.getenv("OLLAMA_URL", "http://localhost:11434")
+GEN_MODEL       = "llama3.2"
+EMBED_MODEL     = "mxbai-embed-large"
+DOCS_DIR        = "./docs"
+CHROMA_DIR      = "./chroma_store"
+COLLECTION      = "rag_knowledge"
+CHUNK_SIZE      = 1000
+CHUNK_OVERLAP   = 150
+TOP_K           = 5
 SCORE_THRESHOLD = 0.40
-RRF_K         = 60
+RRF_K           = 60
 
-# ─── DeepEval judge model (fully local — no OpenAI key required) ─────────────
-#
-# OllamaModel wraps your local Ollama server as a DeepEval-compatible judge.
-# The same llama3.2 you use for generation acts as the evaluation judge.
-# This is intentionally consistent with the RAGAS approach where the local
-# LLM was also the judge.
-#
-# If you have a bigger model available (e.g., llama3.1:8b, mistral, etc.)
-# set JUDGE_MODEL to that name for more reliable evaluation.
-
+# Judge model — swap for a larger local model (e.g. llama3.1:8b) for better eval.
 JUDGE_MODEL = os.getenv("DEEPEVAL_JUDGE_MODEL", GEN_MODEL)
 
 judge_llm = OllamaModel(
@@ -100,13 +86,7 @@ judge_llm = OllamaModel(
 )
 
 # ─── GROUND TRUTH DATASET ───────────────────────────────────────────────────
-#
-# IDENTICAL to the dataset in rag_evaluate.py (RAGAS version).
-# This is intentional: same questions + same ground truths = cross-framework
-# comparison without confounding variables.
-#
-# DeepEval requires `expected_output` (= our ground_truth) to compute
-# ContextualRecall and ContextualPrecision.
+# Identical to rag_evaluate.py so scores are directly comparable.
 
 GROUND_TRUTH = [
     # ── Category A: Factual / Definition ────────────────────────────────────
@@ -278,30 +258,35 @@ GROUND_TRUTH = [
     },
 ]
 
-# ─── RAG PIPELINE (identical to rag_evaluate.py) ────────────────────────────
+# ─── OLLAMA HELPERS ──────────────────────────────────────────────────────────
+# /api/embed is the correct endpoint for Ollama >= 0.2.
+# request body : {"model": ..., "input": text}
+# response body: {"embeddings": [[...float...]]}
 
-def ollama_embed(texts):
+def ollama_embed(texts: list) -> list:
     embeddings = []
     for text in texts:
         r = requests.post(
-            f"{OLLAMA_URL}/api/embeddings",
-            json={"model": EMBED_MODEL, "prompt": text}
+            f"{OLLAMA_URL}/api/embed",
+            json={"model": EMBED_MODEL, "input": text},
         )
         r.raise_for_status()
-        embeddings.append(r.json()["embedding"])
+        embeddings.append(r.json()["embeddings"][0])
     return embeddings
 
 
-def ollama_generate(prompt):
+def ollama_generate(prompt: str) -> str:
     r = requests.post(
         f"{OLLAMA_URL}/api/generate",
-        json={"model": GEN_MODEL, "prompt": prompt, "stream": False}
+        json={"model": GEN_MODEL, "prompt": prompt, "stream": False},
     )
     r.raise_for_status()
     return r.json()["response"].strip()
 
 
-def load_pdf(path):
+# ─── DOCUMENT LOADING ────────────────────────────────────────────────────────
+
+def load_pdf(path: str) -> list:
     from pypdf import PdfReader
     reader = PdfReader(path)
     pages  = []
@@ -312,28 +297,34 @@ def load_pdf(path):
     return pages
 
 
-def load_documents(docs_dir):
+def load_documents(docs_dir: str) -> list:
     docs = []
     for filepath in Path(docs_dir).glob("**/*"):
         if filepath.suffix.lower() == ".pdf":
             pages = load_pdf(str(filepath))
             if pages:
                 docs.append({"source": str(filepath), "pages": pages})
+                print(f"  Loaded: {filepath.name} ({len(pages)} pages)")
         elif filepath.suffix.lower() == ".txt":
             with open(str(filepath), "r", encoding="utf-8") as f:
                 text = f.read()
             if text.strip():
                 docs.append({
                     "source": str(filepath),
-                    "pages": [{"text": text, "page": None}]
+                    "pages": [{"text": text, "page": None}],
                 })
+                print(f"  Loaded: {filepath.name}")
     return docs
 
 
-def chunk_text(text, chunk_size, overlap):
+# ─── CHUNKING ────────────────────────────────────────────────────────────────
+
+def chunk_text(text: str, chunk_size: int, overlap: int) -> list:
     from nltk.tokenize import sent_tokenize
-    sentences = sent_tokenize(text)
-    chunks, current, current_len = [], [], 0
+    sentences   = sent_tokenize(text)
+    chunks      = []
+    current     = []
+    current_len = 0
     for sent in sentences:
         slen = len(sent)
         if current_len + slen > chunk_size and current:
@@ -352,7 +343,7 @@ def chunk_text(text, chunk_size, overlap):
     return [c for c in chunks if len(c) > 30]
 
 
-def chunk_documents(docs):
+def chunk_documents(docs: list) -> list:
     all_chunks = []
     for doc in docs:
         for pb in doc["pages"]:
@@ -362,12 +353,16 @@ def chunk_documents(docs):
                     f"{doc['source']}_{page_num}_{i}".encode()
                 ).hexdigest()
                 all_chunks.append({
-                    "id": cid, "text": chunk,
-                    "source": doc["source"],
-                    "page": page_num, "chunk_index": i,
+                    "id":          cid,
+                    "text":        chunk,
+                    "source":      doc["source"],
+                    "page":        page_num,
+                    "chunk_index": i,
                 })
     return all_chunks
 
+
+# ─── CHROMADB ────────────────────────────────────────────────────────────────
 
 def get_collection():
     client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -376,9 +371,9 @@ def get_collection():
     )
 
 
-def index_chunks(collection, chunks):
+def index_chunks(collection, chunks: list):
     existing = set(collection.get()["ids"])
-    new = [c for c in chunks if c["id"] not in existing]
+    new      = [c for c in chunks if c["id"] not in existing]
     if not new:
         print("  ChromaDB: all chunks already indexed.")
         return
@@ -386,40 +381,44 @@ def index_chunks(collection, chunks):
     for i, chunk in enumerate(new):
         emb = ollama_embed([chunk["text"]])[0]
         collection.add(
-            ids=[chunk["id"]], embeddings=[emb],
-            documents=[chunk["text"]],
-            metadatas=[{
+            ids        = [chunk["id"]],
+            embeddings = [emb],
+            documents  = [chunk["text"]],
+            metadatas  = [{
                 "source":      chunk["source"],
                 "page":        chunk["page"],
                 "chunk_index": chunk["chunk_index"],
-            }]
+            }],
         )
         if (i + 1) % 100 == 0:
             print(f"  {i+1}/{len(new)}...")
     print("  Done.")
 
 
+# ─── BM25 ────────────────────────────────────────────────────────────────────
+
 class BM25Index:
-    def __init__(self, chunks):
+    def __init__(self, chunks: list):
         self.chunks = chunks
         self.bm25   = BM25Okapi([c["text"].lower().split() for c in chunks])
 
-    def search(self, query, top_k):
+    def search(self, query: str, top_k: int) -> list:
         scores = self.bm25.get_scores(query.lower().split())
-        ranked = sorted(
-            zip(scores, self.chunks), key=lambda x: x[0], reverse=True
-        )[:top_k]
+        ranked = sorted(zip(scores, self.chunks), key=lambda x: x[0], reverse=True)[:top_k]
         return [
             {**chunk, "bm25_score": round(float(score), 4)}
             for score, chunk in ranked if score > 0
         ]
 
 
-def hybrid_retrieve(query, collection, bm25_index):
+# ─── HYBRID RETRIEVAL ────────────────────────────────────────────────────────
+
+def hybrid_retrieve(query: str, collection, bm25_index: BM25Index) -> list:
     qemb = ollama_embed([query])[0]
     res  = collection.query(
-        query_embeddings=[qemb], n_results=TOP_K,
-        include=["documents", "metadatas", "distances"]
+        query_embeddings = [qemb],
+        n_results        = TOP_K,
+        include          = ["documents", "metadatas", "distances"],
     )
     semantic = []
     for text, meta, dist in zip(
@@ -435,8 +434,12 @@ def hybrid_retrieve(query, collection, bm25_index):
             })
 
     bm25_hits = [
-        {"text": c["text"], "source": Path(c["source"]).name,
-         "page": c["page"], "bm25_score": c["bm25_score"]}
+        {
+            "text":       c["text"],
+            "source":     Path(c["source"]).name,
+            "page":       c["page"],
+            "bm25_score": c["bm25_score"],
+        }
         for c in bm25_index.search(query, TOP_K)
     ]
 
@@ -460,7 +463,9 @@ def hybrid_retrieve(query, collection, bm25_index):
     return results
 
 
-def generate_answer(question, retrieved):
+# ─── GENERATION ──────────────────────────────────────────────────────────────
+
+def generate_answer(question: str, retrieved: list) -> str:
     if not retrieved:
         return "I could not find relevant information in the indexed documents."
     context = "\n\n".join(
@@ -482,107 +487,51 @@ Answer:"""
     return ollama_generate(prompt)
 
 
-# ─── DeepEval METRIC RUNNER ──────────────────────────────────────────────────
-#
-# DeepEval vs RAGAS — key structural difference:
-#
-#  RAGAS:    free-form LLM prompt → parse number from response text
-#  DeepEval: structured Pydantic LLM call → validated JSON → score + reason
-#
-# For each question we build an LLMTestCase (DeepEval's standard object)
-# and measure all five metrics independently.
-#
-# Metric signatures:
-#   FaithfulnessMetric(model)      → needs: actual_output, retrieval_context
-#   AnswerRelevancyMetric(model)   → needs: input, actual_output
-#   ContextualPrecisionMetric(model) → needs: input, actual_output,
-#                                              expected_output, retrieval_context
-#   ContextualRecallMetric(model)  → needs: expected_output, retrieval_context
-#   HallucinationMetric(model)     → needs: actual_output, context
-#                                    (context = list of raw strings, not LLMTestCase)
+# ─── DeepEval METRICS ────────────────────────────────────────────────────────
 
-def run_deepeval_metrics(question, answer, retrieved, expected_output):
-    """
-    Runs all five DeepEval metrics for one test case.
-    Returns a dict with keys: faithfulness, answer_relevancy,
-    contextual_precision, contextual_recall, hallucination, reasons.
-    """
+def run_deepeval_metrics(
+    question:        str,
+    answer:          str,
+    retrieved:       list,
+    expected_output: str,
+) -> tuple:
     retrieval_context = [r["text"] for r in retrieved]
 
-    # Build the LLMTestCase (DeepEval's core evaluation unit)
     test_case = LLMTestCase(
-        input            = question,
-        actual_output    = answer,
-        expected_output  = expected_output,
-        retrieval_context= retrieval_context,
-        # 'context' is used by HallucinationMetric for factual grounding
-        context          = retrieval_context,
+        input             = question,
+        actual_output     = answer,
+        expected_output   = expected_output,
+        retrieval_context = retrieval_context,
+        context           = retrieval_context,
     )
 
     scores  = {}
     reasons = {}
 
-    # 1. Faithfulness — contradictions between answer and retrieved context
-    try:
-        m = FaithfulnessMetric(model=judge_llm, include_reason=True)
-        m.measure(test_case)
-        scores["faithfulness"]  = round(m.score, 3)
-        reasons["faithfulness"] = m.reason
-    except Exception as e:
-        scores["faithfulness"]  = None
-        reasons["faithfulness"] = f"ERROR: {e}"
-
-    # 2. Answer Relevancy — does the answer address the question?
-    try:
-        m = AnswerRelevancyMetric(model=judge_llm, include_reason=True)
-        m.measure(test_case)
-        scores["answer_relevancy"]  = round(m.score, 3)
-        reasons["answer_relevancy"] = m.reason
-    except Exception as e:
-        scores["answer_relevancy"]  = None
-        reasons["answer_relevancy"] = f"ERROR: {e}"
-
-    # 3. Contextual Precision — are relevant chunks ranked higher than noise?
-    #    (Requires expected_output to know what "relevant" means)
-    try:
-        m = ContextualPrecisionMetric(model=judge_llm, include_reason=True)
-        m.measure(test_case)
-        scores["contextual_precision"]  = round(m.score, 3)
-        reasons["contextual_precision"] = m.reason
-    except Exception as e:
-        scores["contextual_precision"]  = None
-        reasons["contextual_precision"] = f"ERROR: {e}"
-
-    # 4. Contextual Recall — does the context cover the expected answer?
-    try:
-        m = ContextualRecallMetric(model=judge_llm, include_reason=True)
-        m.measure(test_case)
-        scores["contextual_recall"]  = round(m.score, 3)
-        reasons["contextual_recall"] = m.reason
-    except Exception as e:
-        scores["contextual_recall"]  = None
-        reasons["contextual_recall"] = f"ERROR: {e}"
-
-    # 5. Hallucination — claims not supported by ANY provided context
-    #    Note: HallucinationMetric score is the hallucination rate (lower = better).
-    #    We store it as-is and flag it in the report as "lower is better".
-    try:
-        m = HallucinationMetric(model=judge_llm, include_reason=True)
-        m.measure(test_case)
-        scores["hallucination"]  = round(m.score, 3)
-        reasons["hallucination"] = m.reason
-    except Exception as e:
-        scores["hallucination"]  = None
-        reasons["hallucination"] = f"ERROR: {e}"
+    for key, MetricClass in [
+        ("faithfulness",         FaithfulnessMetric),
+        ("answer_relevancy",     AnswerRelevancyMetric),
+        ("contextual_precision", ContextualPrecisionMetric),
+        ("contextual_recall",    ContextualRecallMetric),
+        ("hallucination",        HallucinationMetric),
+    ]:
+        try:
+            m = MetricClass(model=judge_llm, include_reason=True)
+            m.measure(test_case)
+            scores[key]  = round(m.score, 3)
+            reasons[key] = m.reason
+        except Exception as e:
+            scores[key]  = None
+            reasons[key] = f"ERROR: {e}"
 
     return scores, reasons
 
 
-# ─── PAGE ACCURACY (deterministic, no LLM needed) ───────────────────────────
+# ─── PAGE ACCURACY ───────────────────────────────────────────────────────────
 
-def score_page_accuracy(retrieved, ground_truth_pages):
+def score_page_accuracy(retrieved: list, ground_truth_pages: list):
     if not ground_truth_pages:
-        return None   # out-of-scope question: N/A
+        return None
     retrieved_pages = set(c["page"] for c in retrieved if c.get("page"))
     hits = len(retrieved_pages & set(ground_truth_pages))
     return round(hits / len(ground_truth_pages), 3)
@@ -603,21 +552,22 @@ AMBER_FONT = "7D6608"
 RED_FONT   = "9C0006"
 
 
-def _fill(c): return PatternFill("solid", start_color=c, fgColor=c)
+def _fill(c):
+    return PatternFill("solid", start_color=c, fgColor=c)
+
 def _font(bold=False, color="000000", size=10):
     return Font(bold=bold, color=color, size=size, name="Arial")
+
 def _border():
     s = Side(style="thin", color="BFBFBF")
     return Border(left=s, right=s, top=s, bottom=s)
+
 def _align(wrap=True, h="left", v="top"):
     return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
 
-
 def _score_color(score, lower_is_better=False):
-    """Return (bg, fg) hex based on 0-1 score."""
     if score is None:
         return GREY, "555555"
-    # For hallucination metric: lower score = better
     effective = (1 - score) if lower_is_better else score
     if effective >= 0.75:
         return GREEN, GREEN_FONT
@@ -626,7 +576,7 @@ def _score_color(score, lower_is_better=False):
     return RED, RED_FONT
 
 
-def build_report(results, output_path):
+def build_report(results: list, output_path: str):
     wb = Workbook()
 
     # ── Sheet 1: Summary ────────────────────────────────────────────────────
@@ -644,73 +594,49 @@ def build_report(results, output_path):
 
     write_title(ws, 1, "RAG Evaluation Report — DeepEval Metrics", "A1:I1")
     ws.merge_cells("A2:I2")
-    ws["A2"].value = (
+    ws["A2"].value     = (
         f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')} | "
         f"RAG model: {GEN_MODEL} | Embeddings: {EMBED_MODEL} | "
-        f"Judge model: {JUDGE_MODEL} | Questions: {len(results)}"
+        f"Judge: {JUDGE_MODEL} | Questions: {len(results)}"
     )
     ws["A2"].font      = _font(color=WHITE, size=9)
     ws["A2"].fill      = _fill(MID_BLUE)
     ws["A2"].alignment = _align(h="center", wrap=False)
     ws.row_dimensions[2].height = 15
 
-    # Metric description table
     ws.merge_cells("A4:I4")
     ws["A4"].value     = "DeepEval metrics — what each measures (vs RAGAS equivalent)"
     ws["A4"].font      = _font(bold=True, color=WHITE, size=10)
     ws["A4"].fill      = _fill(MID_BLUE)
     ws["A4"].alignment = _align(h="center", wrap=False)
 
-    metric_desc = [
-        ("Faithfulness",
-         "Generator",
-         "RAGAS: Faithfulness",
-         "Does the answer contradict the retrieved context? DeepEval decomposes "
-         "the answer into atomic claims and checks each against the context. "
-         "Higher = fewer contradictions. The key difference vs RAGAS: DeepEval "
-         "uses structured JSON output, making it more deterministic."),
-        ("Answer Relevancy",
-         "Generator",
-         "RAGAS: Answer Relevancy",
-         "Does the answer address the question? DeepEval generates hypothetical "
-         "questions from the answer and measures semantic overlap with the original."),
-        ("Contextual Precision",
-         "Retriever",
-         "RAGAS: Context Precision",
-         "Are the relevant chunks ranked higher than irrelevant ones? "
-         "Measures retrieval ranking quality, not just what was retrieved."),
-        ("Contextual Recall",
-         "Retriever",
-         "RAGAS: Context Recall",
-         "Does the retrieved context contain the information needed to produce "
-         "the expected output? Measures retrieval completeness."),
-        ("Hallucination",
-         "End-to-end",
-         "No direct RAGAS equivalent",
-         "What fraction of claims in the answer are NOT supported by context? "
-         "⚠️  LOWER IS BETTER for this metric. Score of 0 = no hallucination. "
-         "This is the most direct hallucination signal in DeepEval."),
-        ("Page Accuracy",
-         "Retriever",
-         "Custom (not in RAGAS/DeepEval)",
-         "Deterministic check: did the retriever find a chunk from the correct "
-         "page(s) of the Basel Framework? N/A for out-of-scope questions."),
-    ]
-
-    for ri, (metric, layer, ragas_eq, desc) in enumerate(metric_desc, start=5):
-        cells = [
-            ws.cell(row=ri, column=1, value=metric),
-            ws.cell(row=ri, column=2, value=layer),
-            ws.cell(row=ri, column=3, value=ragas_eq),
-            ws.cell(row=ri, column=4, value=desc),
-        ]
+    for ri, (metric, layer, ragas_eq, desc) in enumerate([
+        ("Faithfulness",         "Generator", "RAGAS: Faithfulness",
+         "Does the answer contradict the retrieved context? Claims are decomposed and "
+         "checked individually. Higher = fewer contradictions."),
+        ("Answer Relevancy",     "Generator", "RAGAS: Answer Relevancy",
+         "Does the answer address the question?"),
+        ("Contextual Precision", "Retriever", "RAGAS: Context Precision",
+         "Are relevant chunks ranked higher than irrelevant ones?"),
+        ("Contextual Recall",    "Retriever", "RAGAS: Context Recall",
+         "Does the retrieved context contain the info needed to produce the expected output?"),
+        ("Hallucination",        "End-to-end", "No direct RAGAS equivalent",
+         "LOWER IS BETTER. Fraction of claims NOT supported by context. 0 = no hallucination."),
+        ("Page Accuracy",        "Retriever", "Custom (deterministic)",
+         "Did the retriever hit the correct page(s)? N/A for out-of-scope questions."),
+    ], start=5):
+        ws.cell(row=ri, column=1, value=metric).font = _font(bold=True, size=9)
+        ws.cell(row=ri, column=2, value=layer)
+        ws.cell(row=ri, column=3, value=ragas_eq)
+        ws.cell(row=ri, column=4, value=desc)
         ws.merge_cells(f"D{ri}:I{ri}")
-        cells[0].font = _font(bold=True, size=9)
-        for c in cells:
+        for ci in range(1, 5):
+            c = ws.cell(row=ri, column=ci)
             c.fill      = _fill(LIGHT_BLUE if ri % 2 == 0 else WHITE)
             c.border    = _border()
             c.alignment = _align(wrap=True, v="center")
-            c.font      = c.font if c.font.bold else _font(size=9)
+            if not c.font.bold:
+                c.font = _font(size=9)
         ws.row_dimensions[ri].height = 36
 
     ws.column_dimensions["A"].width = 22
@@ -718,50 +644,42 @@ def build_report(results, output_path):
     ws.column_dimensions["C"].width = 28
     ws.column_dimensions["D"].width = 70
 
-    # Aggregate score bar
     ws.row_dimensions[11].height = 10
-    write_title(ws, 12, "Aggregate scores (mean across all questions)", "A12:I12",
-                bg=MID_BLUE, size=10)
+    write_title(ws, 12, "Aggregate scores (mean across all questions)",
+                "A12:I12", bg=MID_BLUE, size=10)
 
-    metric_keys = [
-        ("Faithfulness",          "faithfulness",         False),
-        ("Answer Relevancy",      "answer_relevancy",     False),
-        ("Contextual Precision",  "contextual_precision", False),
-        ("Contextual Recall",     "contextual_recall",    False),
-        ("Hallucination",         "hallucination",        True),   # lower = better
-        ("Page Accuracy",         "page_accuracy",        False),
-    ]
-
-    for ci, (label, key, lib) in enumerate(metric_keys, start=1):
+    for ci, (label, key, lib) in enumerate([
+        ("Faithfulness",         "faithfulness",         False),
+        ("Answer Relevancy",     "answer_relevancy",     False),
+        ("Contextual Precision", "contextual_precision", False),
+        ("Contextual Recall",    "contextual_recall",    False),
+        ("Hallucination\n(lower=better)", "hallucination", True),
+        ("Page Accuracy",        "page_accuracy",        False),
+    ], start=1):
         vals = [r[key] for r in results if r.get(key) is not None]
         avg  = round(sum(vals) / len(vals), 3) if vals else None
         bg, fg = _score_color(avg, lower_is_better=lib)
 
-        hc = ws.cell(row=13, column=ci, value=label + ("\n(lower=better)" if lib else ""))
-        hc.font      = _font(bold=True, size=8, color="555555")
-        hc.fill      = _fill(GREY)
-        hc.alignment = _align(h="center", wrap=True)
-        hc.border    = _border()
+        hc = ws.cell(row=13, column=ci, value=label)
+        hc.font = _font(bold=True, size=8, color="555555")
+        hc.fill = _fill(GREY); hc.alignment = _align(h="center", wrap=True)
+        hc.border = _border()
 
         vc = ws.cell(row=14, column=ci, value=f"{avg:.2f}" if avg is not None else "N/A")
-        vc.font      = _font(bold=True, size=20, color=fg)
-        vc.fill      = _fill(bg)
-        vc.alignment = _align(h="center", v="center", wrap=False)
-        vc.border    = _border()
+        vc.font = _font(bold=True, size=20, color=fg)
+        vc.fill = _fill(bg); vc.alignment = _align(h="center", v="center", wrap=False)
+        vc.border = _border()
         ws.row_dimensions[14].height = 40
-
         ws.column_dimensions[get_column_letter(ci)].width = 20
 
-    # Score interpretation
     ws.row_dimensions[15].height = 10
-    write_title(ws, 16, "Score interpretation (except Hallucination where lower is better)",
+    write_title(ws, 16, "Score interpretation (Hallucination: lower is better)",
                 "A16:I16", bg=MID_BLUE, size=10)
-    guide = [
-        ("≥ 0.75", "Good",  GREEN, GREEN_FONT, "System is performing well."),
-        ("0.40–0.74", "Fair", AMBER, AMBER_FONT, "Acceptable but investigate failures."),
-        ("< 0.40",  "Poor",  RED,   RED_FONT,  "Systematic issue. Check chunk size, TOP_K, or embedding model."),
-    ]
-    for ri, (rng, label, bg, fg, advice) in enumerate(guide, start=17):
+    for ri, (rng, label, bg, fg, advice) in enumerate([
+        (">=0.75", "Good",  GREEN, GREEN_FONT, "Performing well."),
+        ("0.40-0.74", "Fair", AMBER, AMBER_FONT, "Acceptable, investigate failures."),
+        ("<0.40",  "Poor",  RED,   RED_FONT,   "Systematic issue — check CHUNK_SIZE, TOP_K, embedding model."),
+    ], start=17):
         rc = ws.cell(row=ri, column=1, value=rng)
         lc = ws.cell(row=ri, column=2, value=label)
         ac = ws.cell(row=ri, column=3, value=advice)
@@ -770,37 +688,29 @@ def build_report(results, output_path):
         lc.font = _font(bold=True, size=10, color=fg)
         ac.font = _font(size=9)
         for c in (rc, lc, ac):
-            c.fill      = _fill(bg)
-            c.border    = _border()
+            c.fill = _fill(bg); c.border = _border()
             c.alignment = _align(h="center" if c is not ac else "left", wrap=False)
         ws.row_dimensions[ri].height = 18
 
     # ── Sheet 2: Per-question scores ─────────────────────────────────────────
     ws2 = wb.create_sheet("Per-Question Scores")
-    headers = [
-        "Question",
-        "Faithfulness\n(↑ higher=better)",
-        "Answer\nRelevancy ↑",
-        "Contextual\nPrecision ↑",
-        "Contextual\nRecall ↑",
-        "Hallucination\n(↓ lower=better)",
-        "Page\nAccuracy ↑",
-        "Pages\nRetrieved",
-        "Pages\nExpected",
-        "Time (s)",
-    ]
+    headers    = ["Question", "Faithfulness↑", "Answer Relevancy↑",
+                  "Contextual Precision↑", "Contextual Recall↑",
+                  "Hallucination↓", "Page Accuracy↑",
+                  "Pages Retrieved", "Pages Expected", "Time (s)"]
     col_widths = [36, 14, 14, 14, 14, 14, 12, 16, 16, 10]
+    score_cols = {2, 3, 4, 5, 6, 7}
+    lib_cols   = {6}
+
     for ci, (h, w) in enumerate(zip(headers, col_widths), start=1):
         c = ws2.cell(row=1, column=ci, value=h)
-        c.font      = _font(bold=True, color=WHITE, size=9)
-        c.fill      = _fill(DARK_BLUE)
+        c.font = _font(bold=True, color=WHITE, size=9)
+        c.fill = _fill(DARK_BLUE)
         c.alignment = _align(h="center", v="center", wrap=True)
-        c.border    = _border()
+        c.border = _border()
         ws2.column_dimensions[get_column_letter(ci)].width = w
     ws2.row_dimensions[1].height = 32
     ws2.freeze_panes = "A2"
-
-    lib_map = {2: False, 3: False, 4: False, 5: False, 6: True, 7: False}
 
     for ri, result in enumerate(results, start=2):
         row_bg   = LIGHT_BLUE if ri % 2 == 0 else WHITE
@@ -817,121 +727,105 @@ def build_report(results, output_path):
             f"{result.get('elapsed_s', 0):.1f}",
         ]
         for ci, val in enumerate(row_data, start=1):
-            c         = ws2.cell(row=ri, column=ci, value=val if val is not None else "N/A")
-            c.border  = _border()
-            c.alignment = _align(wrap=True)
-            c.font    = _font(size=9)
-            if ci in lib_map and isinstance(val, float):
-                bg, fg = _score_color(val, lower_is_better=lib_map[ci])
-                c.fill  = _fill(bg)
-                c.font  = _font(bold=True, color=fg, size=9)
+            c = ws2.cell(row=ri, column=ci, value=val if val is not None else "N/A")
+            c.border = _border(); c.alignment = _align(wrap=True); c.font = _font(size=9)
+            if ci in score_cols and isinstance(val, float):
+                bg, fg = _score_color(val, lower_is_better=(ci in lib_cols))
+                c.fill = _fill(bg); c.font = _font(bold=True, color=fg, size=9)
                 c.value = f"{val:.2f}"
-            elif ci in lib_map and val is None:
+            elif ci in score_cols:
                 c.fill = _fill(GREY)
             else:
                 c.fill = _fill(row_bg)
         ws2.row_dimensions[ri].height = 60
 
-    # ── Sheet 3: Reasons (DeepEval's unique feature — explanation per score) ──
+    # ── Sheet 3: Reasons ─────────────────────────────────────────────────────
     ws3 = wb.create_sheet("Reasons")
     ws3.merge_cells("A1:F1")
-    ws3["A1"].value     = "DeepEval Reasons — the LLM judge explains every score"
+    ws3["A1"].value     = "DeepEval — LLM judge explanation for every score"
     ws3["A1"].font      = _font(bold=True, color=WHITE, size=11)
     ws3["A1"].fill      = _fill(DARK_BLUE)
     ws3["A1"].alignment = _align(h="center", wrap=False)
     ws3.row_dimensions[1].height = 22
 
-    reason_headers = ["Question", "Faithfulness", "Answer Relevancy",
-                      "Contextual Precision", "Contextual Recall", "Hallucination"]
-    reason_keys    = ["faithfulness", "answer_relevancy",
-                      "contextual_precision", "contextual_recall", "hallucination"]
-    reason_widths  = [36, 30, 30, 30, 30, 30]
+    r_headers = ["Question", "Faithfulness", "Answer Relevancy",
+                 "Contextual Precision", "Contextual Recall", "Hallucination"]
+    r_keys    = ["faithfulness", "answer_relevancy",
+                 "contextual_precision", "contextual_recall", "hallucination"]
+    r_widths  = [36, 30, 30, 30, 30, 30]
 
-    for ci, (h, w) in enumerate(zip(reason_headers, reason_widths), start=1):
+    for ci, (h, w) in enumerate(zip(r_headers, r_widths), start=1):
         c = ws3.cell(row=2, column=ci, value=h)
-        c.font      = _font(bold=True, color=WHITE, size=9)
-        c.fill      = _fill(MID_BLUE)
-        c.alignment = _align(h="center", wrap=True)
-        c.border    = _border()
+        c.font = _font(bold=True, color=WHITE, size=9)
+        c.fill = _fill(MID_BLUE)
+        c.alignment = _align(h="center", wrap=True); c.border = _border()
         ws3.column_dimensions[get_column_letter(ci)].width = w
     ws3.row_dimensions[2].height = 20
     ws3.freeze_panes = "A3"
 
     for ri, result in enumerate(results, start=3):
         row_bg = LIGHT_BLUE if ri % 2 == 0 else WHITE
-        ws3.cell(row=ri, column=1, value=result["question"]).fill = _fill(row_bg)
-        ws3.cell(row=ri, column=1).border    = _border()
-        ws3.cell(row=ri, column=1).alignment = _align(wrap=True)
-        ws3.cell(row=ri, column=1).font      = _font(size=9)
-        for ci, key in enumerate(reason_keys, start=2):
-            reason = result.get("reasons", {}).get(key, "N/A")
-            c      = ws3.cell(row=ri, column=ci, value=reason)
-            c.font      = _font(size=9)
-            c.fill      = _fill(row_bg)
-            c.border    = _border()
-            c.alignment = _align(wrap=True)
+        c = ws3.cell(row=ri, column=1, value=result["question"])
+        c.fill = _fill(row_bg); c.border = _border()
+        c.alignment = _align(wrap=True); c.font = _font(size=9)
+        for ci, key in enumerate(r_keys, start=2):
+            c = ws3.cell(row=ri, column=ci,
+                         value=result.get("reasons", {}).get(key, "N/A"))
+            c.font = _font(size=9); c.fill = _fill(row_bg)
+            c.border = _border(); c.alignment = _align(wrap=True)
         ws3.row_dimensions[ri].height = 90
 
-    # ── Sheet 4: Config snapshot ─────────────────────────────────────────────
+    # ── Sheet 4: Config ──────────────────────────────────────────────────────
     ws4 = wb.create_sheet("Config")
-    cfg = [
-        ("Parameter",        "Value"),
-        ("OLLAMA_URL",        OLLAMA_URL),
-        ("GEN_MODEL",         GEN_MODEL),
-        ("EMBED_MODEL",       EMBED_MODEL),
-        ("JUDGE_MODEL",       JUDGE_MODEL),
-        ("CHUNK_SIZE",        CHUNK_SIZE),
-        ("CHUNK_OVERLAP",     CHUNK_OVERLAP),
-        ("TOP_K",             TOP_K),
-        ("SCORE_THRESHOLD",   SCORE_THRESHOLD),
-        ("RRF_K",             RRF_K),
-        ("Questions",         len(results)),
-        ("Run timestamp",     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        ("Framework",         "DeepEval (confident-ai)"),
-    ]
-    for ri, (k, v) in enumerate(cfg, start=1):
+    for ri, (k, v) in enumerate([
+        ("Parameter",      "Value"),
+        ("OLLAMA_URL",      OLLAMA_URL),
+        ("GEN_MODEL",       GEN_MODEL),
+        ("EMBED_MODEL",     EMBED_MODEL),
+        ("JUDGE_MODEL",     JUDGE_MODEL),
+        ("CHUNK_SIZE",      CHUNK_SIZE),
+        ("CHUNK_OVERLAP",   CHUNK_OVERLAP),
+        ("TOP_K",           TOP_K),
+        ("SCORE_THRESHOLD", SCORE_THRESHOLD),
+        ("RRF_K",           RRF_K),
+        ("Questions",       len(results)),
+        ("Ollama endpoint", "/api/embed  (>= 0.2)"),
+        ("Framework",       "DeepEval (confident-ai)"),
+        ("Run timestamp",   datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    ], start=1):
         ck = ws4.cell(row=ri, column=1, value=k)
         cv = ws4.cell(row=ri, column=2, value=v)
         if ri == 1:
             for c in (ck, cv):
-                c.font = _font(bold=True, color=WHITE)
-                c.fill = _fill(DARK_BLUE)
+                c.font = _font(bold=True, color=WHITE); c.fill = _fill(DARK_BLUE)
         else:
             bg = LIGHT_BLUE if ri % 2 == 0 else WHITE
             for c in (ck, cv):
-                c.fill = _fill(bg)
-                c.font = _font(size=10)
+                c.fill = _fill(bg); c.font = _font(size=10)
         for c in (ck, cv):
-            c.border    = _border()
-            c.alignment = _align(wrap=False)
+            c.border = _border(); c.alignment = _align(wrap=False)
     ws4.column_dimensions["A"].width = 22
     ws4.column_dimensions["B"].width = 40
 
     wb.save(output_path)
-    print(f"\n  Report saved: {output_path}")
+    print(f"\n  Report saved → {output_path}")
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    print("\n=== RAG Evaluation — DeepEval Metrics (5-step scientific method) ===\n")
+    print("\n=== RAG Evaluation — DeepEval (5-step scientific method) ===\n")
 
-    # ── 1. OBSERVATION ───────────────────────────────────────────────────────
     print("STEP 1 — OBSERVATION")
-    print("  Problem: LLMs hallucinate when answering regulatory questions.")
-    print("  Hypothesis: our hybrid RAG + Llama3.2 reduces hallucination")
-    print("  on the Basel Framework. DeepEval will verify this with five")
-    print("  structured LLM-judge metrics, independently of RAGAS.\n")
+    print("  LLMs hallucinate on unseen regulatory documents.")
+    print("  Our hybrid RAG over the Basel Framework should reduce this.")
+    print("  DeepEval verifies with 5 structured LLM-judge metrics.\n")
 
-    # ── 2. HYPOTHESIS ────────────────────────────────────────────────────────
     print("STEP 2 — HYPOTHESIS")
-    print(f"  RAG config: GEN={GEN_MODEL}, EMBED={EMBED_MODEL}")
-    print(f"  Retriever:  ChromaDB (cosine) + BM25 hybrid, TOP_K={TOP_K}, RRF_K={RRF_K}")
-    print(f"  Judge:      OllamaModel({JUDGE_MODEL}) — fully local, no OpenAI key")
-    print(f"  Metrics:    Faithfulness ↑  AnswerRelevancy ↑  ContextualPrecision ↑")
-    print(f"              ContextualRecall ↑  Hallucination ↓ (lower=better)\n")
+    print(f"  RAG   : {GEN_MODEL} + {EMBED_MODEL}, TOP_K={TOP_K}, RRF_K={RRF_K}")
+    print(f"  Judge : OllamaModel({JUDGE_MODEL}) — fully local, no OpenAI key")
+    print(f"  Endpoint: {OLLAMA_URL}/api/embed  (Ollama >= 0.2)\n")
 
-    # ── 3. EXPERIMENT — setup ────────────────────────────────────────────────
     print("STEP 3 — EXPERIMENT")
     print(f"  [1/3] Loading documents from '{DOCS_DIR}'...")
     docs = load_documents(DOCS_DIR)
@@ -942,12 +836,11 @@ def main():
     print(f"  {len(chunks)} chunks ready.\n")
 
     print("  [2/3] Setting up indexes...")
-    collection  = get_collection()
+    collection = get_collection()
     index_chunks(collection, chunks)
-    bm25_index  = BM25Index(chunks)
+    bm25_index = BM25Index(chunks)
 
-    print(f"\n  [3/3] Evaluating {len(GROUND_TRUTH)} questions with DeepEval...\n")
-
+    print(f"\n  [3/3] Evaluating {len(GROUND_TRUTH)} questions...\n")
     header = (f"  {'Question':<40} {'Faith':>6} {'Relev':>6} "
               f"{'CPrec':>6} {'CRec':>6} {'Halluc':>7} {'Page':>6} {'Time':>6}")
     print(header)
@@ -962,29 +855,22 @@ def main():
         t0        = time.time()
         retrieved = hybrid_retrieve(question, collection, bm25_index)
         answer    = generate_answer(question, retrieved)
-
-        # DeepEval metrics
         scores, reasons = run_deepeval_metrics(
             question, answer, retrieved, expected_output
         )
-
-        # Page accuracy (deterministic)
-        pa = score_page_accuracy(retrieved, gt_pages)
-
+        pa      = score_page_accuracy(retrieved, gt_pages)
         elapsed = round(time.time() - t0, 1)
 
-        def _fmt(v, lib=False):
-            if v is None:
-                return "  N/A"
-            return f"{v:6.2f}"
+        def _f(v):
+            return f"{v:6.2f}" if v is not None else "   N/A"
 
         print(
             f"  {question[:40]:<40} "
-            f"{_fmt(scores.get('faithfulness')):>6} "
-            f"{_fmt(scores.get('answer_relevancy')):>6} "
-            f"{_fmt(scores.get('contextual_precision')):>6} "
-            f"{_fmt(scores.get('contextual_recall')):>6} "
-            f"{_fmt(scores.get('hallucination')):>7} "
+            f"{_f(scores.get('faithfulness')):>6} "
+            f"{_f(scores.get('answer_relevancy')):>6} "
+            f"{_f(scores.get('contextual_precision')):>6} "
+            f"{_f(scores.get('contextual_recall')):>6} "
+            f"{_f(scores.get('hallucination')):>7} "
             f"{'N/A' if pa is None else f'{pa:5.2f}':>6} "
             f"{elapsed}s"
         )
@@ -997,49 +883,40 @@ def main():
             "retrieved_pages":      sorted(set(
                 c["page"] for c in retrieved if c.get("page")
             )),
-            "faithfulness":         scores.get("faithfulness"),
-            "answer_relevancy":     scores.get("answer_relevancy"),
-            "contextual_precision": scores.get("contextual_precision"),
-            "contextual_recall":    scores.get("contextual_recall"),
-            "hallucination":        scores.get("hallucination"),
-            "page_accuracy":        pa,
-            "reasons":              reasons,
-            "elapsed_s":            elapsed,
+            **scores,
+            "page_accuracy": pa,
+            "reasons":       reasons,
+            "elapsed_s":     elapsed,
         })
 
-    # ── 4. ANALYSIS — aggregate ───────────────────────────────────────────────
-    print("\nSTEP 4 — ANALYSIS (aggregate means)\n")
-
+    print("\nSTEP 4 — ANALYSIS\n")
     def mean(key):
         vals = [r[key] for r in results if r.get(key) is not None]
         return round(sum(vals) / len(vals), 3) if vals else None
 
     for label, key, lib in [
-        ("Faithfulness         (↑)", "faithfulness",         False),
-        ("Answer Relevancy     (↑)", "answer_relevancy",     False),
-        ("Contextual Precision (↑)", "contextual_precision", False),
-        ("Contextual Recall    (↑)", "contextual_recall",    False),
-        ("Hallucination        (↓)", "hallucination",        True),
-        ("Page Accuracy        (↑)", "page_accuracy",        False),
+        ("Faithfulness         (higher=better)", "faithfulness",         False),
+        ("Answer Relevancy     (higher=better)", "answer_relevancy",     False),
+        ("Contextual Precision (higher=better)", "contextual_precision", False),
+        ("Contextual Recall    (higher=better)", "contextual_recall",    False),
+        ("Hallucination        (LOWER=better) ", "hallucination",        True),
+        ("Page Accuracy        (higher=better)", "page_accuracy",        False),
     ]:
         val = mean(key)
-        tag = "✓" if (val is not None and ((lib and val < 0.25) or (not lib and val >= 0.75))) else \
-              "~" if (val is not None and ((lib and val < 0.50) or (not lib and val >= 0.40))) else "✗"
-        print(f"  {label}: {val:.3f}  {tag}" if val is not None else f"  {label}: N/A")
+        if val is None:
+            print(f"  {label}: N/A")
+            continue
+        good = (lib and val < 0.25) or (not lib and val >= 0.75)
+        fair = (lib and val < 0.50) or (not lib and val >= 0.40)
+        tag  = "GOOD" if good else "FAIR" if fair else "POOR"
+        print(f"  {label}: {val:.3f}  [{tag}]")
 
-    # ── 5. CONCLUSION — export ───────────────────────────────────────────────
     print("\nSTEP 5 — CONCLUSION")
-    print("  Exporting colour-coded Excel report with per-metric scores,")
-    print("  LLM-judge reasons, and cross-framework comparison notes...\n")
-
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"deepeval_report_{ts}.xlsx"
     build_report(results, output_path)
-
-    print("\n  Done. Open the report to compare DeepEval vs RAGAS results.")
-    print("  Key difference: Sheet 'Reasons' contains the LLM judge's")
-    print("  natural-language explanation for every score — RAGAS does not")
-    print("  produce this. Use it to debug specific retrieval/generation failures.\n")
+    print("  Open the 'Reasons' sheet to see the LLM judge's plain-English")
+    print("  explanation for every score — the primary debugging tool.\n")
 
 
 if __name__ == "__main__":
