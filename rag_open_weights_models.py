@@ -45,7 +45,7 @@ nltk.download("punkt_tab", quiet=True)
 
 OLLAMA_URL      = os.getenv("OLLAMA_URL", "http://localhost:11434")
 GEN_MODEL       = "llama3.2"
-EMBED_MODEL     = "nomic-embed-text"
+EMBED_MODEL     = "mxbai-embed-large"
 DOCS_DIR        = "./docs"
 CHROMA_DIR      = "./chroma_store"
 COLLECTION      = "rag_knowledge"
@@ -58,6 +58,12 @@ RRF_K           = 60
 # ─── OLLAMA HELPERS ──────────────────────────────────────────────────────────
 # Uses /api/embed (Ollama >= 0.2).
 # Old /api/embeddings returns 404 on recent Ollama builds.
+
+#What is Tier 1 capital?
+#What is the definition of a Global Systemically Important Bank (G-SIB)?
+#What does LCR stand for, and what is its minimum requirement?
+#How does the Basel Framework define a trading book?
+#What is the Net Stable Funding Ratio (NSFR)?
 
 def ollama_embed(texts: list) -> list:
     embeddings = []
