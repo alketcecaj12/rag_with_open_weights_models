@@ -1,11 +1,11 @@
-# rag_evaluate_trulens.py — TruLens evaluation for the hybrid RAG
+# rag_evaluate_trulens.py — TruLens RAG Triad evaluation for the hybrid RAG
 #
 # 5-step scientific method (mirrors rag_evaluate.py and rag_evaluate_deepeval.py):
 #
 #  1. OBSERVATION   — LLMs hallucinate; RAG is meant to fix that.
 #  2. HYPOTHESIS    — TruLens RAG Triad (Context Relevance, Groundedness,
 #                     Answer Relevance) will verify where the system succeeds
-#                     and fails, with OpenTelemetry-based tracing.
+#                     and fails, with chain-of-thought reasoning per score.
 #  3. EXPERIMENT    — Run the full hybrid-RAG pipeline against the same
 #                     GROUND_TRUTH dataset used in RAGAS and DeepEval.
 #  4. ANALYSIS      — Score each question, print a leaderboard table,
@@ -13,40 +13,43 @@
 #  5. CONCLUSION    — Compare TruLens scores with RAGAS and DeepEval to get
 #                     a three-framework view of RAG quality.
 #
-# TruLens RAG Triad — the three feedback functions:
+# TruLens RAG Triad — three feedback functions (all higher = better):
 #
-#  • Context Relevance   — Is the retrieved context relevant to the query?
-#                          (Retriever quality)
-#  • Groundedness        — Is the answer grounded in the retrieved context?
-#                          (Generator faithfulness — lower hallucination = higher score)
-#  • Answer Relevance    — Does the answer address the original question?
-#                          (End-to-end utility)
+#  • Context Relevance  — Is each retrieved chunk relevant to the query?
+#                         (maps to RAGAS Context Precision / DeepEval ContextualPrecision)
+#  • Groundedness       — Is the answer grounded in the retrieved context?
+#                         (maps to RAGAS Faithfulness / DeepEval Faithfulness)
+#  • Answer Relevance   — Does the answer address the original question?
+#                         (maps to RAGAS Answer Relevancy / DeepEval AnswerRelevancy)
 #
 # KEY DIFFERENCE vs RAGAS and DeepEval:
-#  TruLens combines evaluation WITH OpenTelemetry tracing. Every question
-#  produces a full execution trace (retrieve → generate) stored in a local
-#  SQLite database (trulens.db). You can launch the TruLens dashboard to
-#  explore traces interactively:
-#    python -c "from trulens.dashboard import run_dashboard; run_dashboard()"
-#
-#  Provider: LiteLLM wrapping Ollama — no OpenAI key needed.
-#  The same llama3.2 used for generation acts as the evaluation judge.
+#  TruLens uses chain-of-thought (CoT) reasoning for every score, meaning the
+#  judge LLM explains its reasoning step-by-step before assigning a number.
+#  This makes scores more interpretable and easier to debug than RAGAS
+#  (free-text parse) or DeepEval (structured JSON).
 #
 # Install:
-#   pip install trulens-core trulens-apps-basic trulens-providers-litellm \
-#               litellm chromadb pypdf nltk rank_bm25 openpyxl requests
+#   pip install trulens trulens-providers-litellm litellm \
+#               chromadb pypdf nltk rank_bm25 openpyxl requests
+#
+# Verified against: trulens==2.8.1, trulens-providers-litellm==2.8.1
+#
+# Imports confirmed working in trulens 2.8.1:
+#   from trulens.core import TruSession, Feedback, Select
+#   from trulens.apps.app import instrument          ← correct path in 2.8.1
+#   from trulens.apps.custom import TruCustomApp
+#   from trulens.providers.litellm import LiteLLM
 #
 # Run:
 #   python rag_evaluate_trulens.py
 #
-# Outputs:
-#   trulens_report_<timestamp>.xlsx   — colour-coded Excel report
-#   trulens.db                        — SQLite trace database (TruLens dashboard)
+# Output:
+#   trulens_report_<timestamp>.xlsx
 #
 # NOTE on Ollama API endpoint:
-#   Ollama >= 0.2 uses /api/embed (not /api/embeddings).
-#   request: {"model": ..., "input": text}
-#   response: {"embeddings": [[...float...]]}
+#   Ollama >= 0.2 uses /api/embed (not /api/embeddings):
+#     request:  {"model": ..., "input": text}
+#     response: {"embeddings": [[...float...]]}
 
 import os
 import time
@@ -63,10 +66,16 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-# TruLens v1 imports
+# ── TruLens v2.8.1 imports ───────────────────────────────────────────────────
+# trulens.apps.app is the correct path for `instrument` in 2.8.1
+# (trulens.apps.custom still works but emits a DeprecationWarning)
 from trulens.core import TruSession, Feedback, Select
-from trulens.apps.basic import TruBasicApp
+from trulens.apps.app import instrument
+from trulens.apps.custom import TruCustomApp
 from trulens.providers.litellm import LiteLLM
+
+import litellm
+litellm.set_verbose = False   # suppress LiteLLM noise
 
 nltk.download("punkt",     quiet=True)
 nltk.download("punkt_tab", quiet=True)
@@ -85,21 +94,17 @@ TOP_K           = 5
 SCORE_THRESHOLD = 0.40
 RRF_K           = 60
 
-# ─── TruLens provider (LiteLLM → Ollama, no OpenAI key) ─────────────────────
-#
-# TruLens uses LiteLLM as the bridge to local Ollama models.
-# The provider acts as the LLM judge for all three RAG Triad feedback functions.
-# Using the same llama3.2 for both generation and evaluation is consistent
-# with the RAGAS and DeepEval setups.
-
+# ── TruLens LiteLLM provider (Ollama, no OpenAI key) ─────────────────────────
+# LiteLLM bridges TruLens to your local Ollama instance.
+# model_engine format: "ollama/<model_name>"
 provider = LiteLLM(
     model_engine = f"ollama/{GEN_MODEL}",
     api_base     = OLLAMA_URL,
 )
 
 # ─── GROUND TRUTH DATASET ────────────────────────────────────────────────────
-# Identical to rag_evaluate.py and rag_evaluate_deepeval.py.
-# Same questions + same ground truths = valid three-framework comparison.
+# Identical to rag_evaluate.py and rag_evaluate_deepeval.py
+# so scores are directly comparable across all three frameworks.
 
 GROUND_TRUTH = [
     # ── Category A: Factual / Definition ────────────────────────────────────
@@ -272,6 +277,7 @@ GROUND_TRUTH = [
 ]
 
 # ─── OLLAMA HELPERS ──────────────────────────────────────────────────────────
+# /api/embed is correct for Ollama >= 0.2
 
 def ollama_embed(texts: list) -> list:
     embeddings = []
@@ -497,110 +503,33 @@ Answer:"""
     return ollama_generate(prompt)
 
 
-# ─── TruLens RAG TRIAD — FEEDBACK FUNCTIONS ──────────────────────────────────
+# ─── TruLens RAG TRIAD SCORING ───────────────────────────────────────────────
 #
-# TruLens RAG Triad (three feedback functions, all using the local LiteLLM provider):
+# We call provider methods directly (synchronous, batch-friendly).
+# This avoids the complexity of TruCustomApp context managers for batch eval.
 #
-#  1. context_relevance  — For each retrieved chunk, is it relevant to the query?
-#                          Averaged across all chunks (np.mean).
-#                          Maps to: RAGAS Context Precision / DeepEval ContextualPrecision
+# Provider methods confirmed available in trulens-providers-litellm 2.8.1:
+#   provider.context_relevance_with_cot_reasons(question, context_chunk)
+#   provider.groundedness_measure_with_cot_reasons(full_context, answer)
+#   provider.relevance_with_cot_reasons(question, answer)
 #
-#  2. groundedness       — Is the answer grounded in the retrieved context?
-#                          Decomposed into claims, each checked against context.
-#                          Maps to: RAGAS Faithfulness / DeepEval Faithfulness + Hallucination
-#
-#  3. answer_relevance   — Does the answer address the original question?
-#                          Maps to: RAGAS Answer Relevancy / DeepEval AnswerRelevancy
-#
-# TruLens uses Select expressions to point feedback functions at specific
-# parts of the execution trace — this is its key architectural difference
-# from RAGAS and DeepEval (which work on plain Python objects).
+# All return a tuple: (float_score, dict_with_reasons)
+# Score is 0.0–1.0. All three metrics: higher = better.
 
-def build_feedback_functions():
-    # Context relevance: evaluated on (input query → each retrieved context chunk)
-    f_context_relevance = (
-        Feedback(
-            provider.context_relevance_with_cot_reasons,
-            name="Context Relevance",
-        )
-        .on_input()
-        .on(Select.RecordCalls.retrieve.rets[:].text)
-        .aggregate(np.mean)
-    )
+def _call_provider(fn, *args):
+    """Call a provider feedback function and safely unpack (score, reason)."""
+    try:
+        result = fn(*args)
+        if isinstance(result, tuple) and len(result) == 2:
+            score  = round(float(result[0]), 3)
+            reason = result[1].get("reason", "") if isinstance(result[1], dict) else str(result[1])
+        else:
+            score  = round(float(result), 3)
+            reason = ""
+        return score, reason
+    except Exception as e:
+        return None, f"ERROR: {e}"
 
-    # Groundedness: evaluated on (retrieved context chunks → generated answer)
-    f_groundedness = (
-        Feedback(
-            provider.groundedness_measure_with_cot_reasons,
-            name="Groundedness",
-        )
-        .on(Select.RecordCalls.retrieve.rets[:].text.collect())
-        .on_output()
-    )
-
-    # Answer relevance: evaluated on (input query → generated answer)
-    f_answer_relevance = (
-        Feedback(
-            provider.relevance_with_cot_reasons,
-            name="Answer Relevance",
-        )
-        .on_input_output()
-    )
-
-    return [f_context_relevance, f_groundedness, f_answer_relevance]
-
-
-# ─── INSTRUMENTED RAG CLASS ───────────────────────────────────────────────────
-#
-# TruLens requires the RAG to be wrapped in a class with @instrument decorators
-# so it can trace each step (retrieve, generate) independently.
-# This is the core TruLens pattern — TruBasicApp wraps a simple callable.
-#
-# The @instrument decorator tells TruLens to log the function's inputs,
-# outputs, and any intermediate values as OpenTelemetry spans.
-
-from trulens.core.otel.instrument import instrument
-
-class InstrumentedRAG:
-    """
-    TruLens-instrumented wrapper around the hybrid RAG pipeline.
-    Each method is decorated with @instrument so TruLens can:
-      - Log inputs/outputs as trace spans
-      - Apply feedback functions to specific span attributes
-      - Track latency and token usage per step
-    """
-
-    def __init__(self, collection, bm25_index):
-        self.collection  = collection
-        self.bm25_index  = bm25_index
-        self._last_retrieved = []   # store for page accuracy check
-
-    @instrument
-    def retrieve(self, query: str) -> list:
-        """Hybrid retrieval: ChromaDB semantic + BM25, merged via RRF."""
-        results = hybrid_retrieve(query, self.collection, self.bm25_index)
-        self._last_retrieved = results
-        return results
-
-    @instrument
-    def generate(self, question: str, retrieved: list) -> str:
-        """Generate answer from retrieved context using llama3.2."""
-        return generate_answer(question, retrieved)
-
-    @instrument
-    def query(self, question: str) -> str:
-        """Full RAG pipeline: retrieve then generate."""
-        retrieved = self.retrieve(question)
-        answer    = self.generate(question, retrieved)
-        return answer
-
-
-# ─── MANUAL TRULENS SCORING ──────────────────────────────────────────────────
-#
-# TruLens normally scores via the TruBasicApp context manager (async).
-# For our batch evaluation loop we call the provider's feedback methods
-# directly — same LLM judge, same scores, but synchronous and controllable.
-# This makes the script self-contained without requiring TruLens' async runner.
 
 def run_trulens_metrics(
     question:  str,
@@ -611,54 +540,33 @@ def run_trulens_metrics(
     scores  = {}
     reasons = {}
 
-    # 1. Context Relevance — per chunk, then averaged
-    ctx_scores = []
-    ctx_reasons = []
+    # 1. Context Relevance — evaluated per chunk, averaged
+    ctx_scores, ctx_reasons = [], []
     for ctx in context_texts:
-        try:
-            result = provider.context_relevance_with_cot_reasons(question, ctx)
-            # result is (score, {"reason": ...}) or just a float depending on version
-            if isinstance(result, tuple):
-                ctx_scores.append(float(result[0]))
-                ctx_reasons.append(result[1].get("reason", "") if isinstance(result[1], dict) else str(result[1]))
-            else:
-                ctx_scores.append(float(result))
-                ctx_reasons.append("")
-        except Exception as e:
-            ctx_scores.append(None)
-            ctx_reasons.append(f"ERROR: {e}")
+        s, r = _call_provider(
+            provider.context_relevance_with_cot_reasons, question, ctx
+        )
+        ctx_scores.append(s)
+        ctx_reasons.append(r)
 
     valid = [s for s in ctx_scores if s is not None]
     scores["context_relevance"]  = round(sum(valid) / len(valid), 3) if valid else None
-    reasons["context_relevance"] = " | ".join(r for r in ctx_reasons if r)
+    reasons["context_relevance"] = " | ".join(r for r in ctx_reasons if r)[:2000]
 
-    # 2. Groundedness — answer vs all context chunks
-    try:
-        result = provider.groundedness_measure_with_cot_reasons(
-            "\n\n".join(context_texts), answer
-        )
-        if isinstance(result, tuple):
-            scores["groundedness"]  = round(float(result[0]), 3)
-            reasons["groundedness"] = result[1].get("reason", "") if isinstance(result[1], dict) else str(result[1])
-        else:
-            scores["groundedness"]  = round(float(result), 3)
-            reasons["groundedness"] = ""
-    except Exception as e:
-        scores["groundedness"]  = None
-        reasons["groundedness"] = f"ERROR: {e}"
+    # 2. Groundedness — full concatenated context vs answer
+    full_context = "\n\n".join(context_texts)
+    s, r = _call_provider(
+        provider.groundedness_measure_with_cot_reasons, full_context, answer
+    )
+    scores["groundedness"]  = s
+    reasons["groundedness"] = r
 
-    # 3. Answer Relevance — answer vs question
-    try:
-        result = provider.relevance_with_cot_reasons(question, answer)
-        if isinstance(result, tuple):
-            scores["answer_relevance"]  = round(float(result[0]), 3)
-            reasons["answer_relevance"] = result[1].get("reason", "") if isinstance(result[1], dict) else str(result[1])
-        else:
-            scores["answer_relevance"]  = round(float(result), 3)
-            reasons["answer_relevance"] = ""
-    except Exception as e:
-        scores["answer_relevance"]  = None
-        reasons["answer_relevance"] = f"ERROR: {e}"
+    # 3. Answer Relevance — question vs answer
+    s, r = _call_provider(
+        provider.relevance_with_cot_reasons, question, answer
+    )
+    scores["answer_relevance"]  = s
+    reasons["answer_relevance"] = r
 
     return scores, reasons
 
@@ -740,7 +648,6 @@ def build_report(results: list, output_path: str):
     ws["A2"].alignment = _align(h="center", wrap=False)
     ws.row_dimensions[2].height = 15
 
-    # RAG Triad explanation
     ws.merge_cells("A4:H4")
     ws["A4"].value     = "TruLens RAG Triad — three feedback functions (all higher = better)"
     ws["A4"].font      = _font(bold=True, color=WHITE, size=10)
@@ -751,19 +658,18 @@ def build_report(results: list, output_path: str):
         ("Context Relevance", "Retriever",
          "RAGAS: Context Precision | DeepEval: ContextualPrecision",
          "For each retrieved chunk, is it relevant to the input query? "
-         "Averaged across all TOP_K chunks. Catches irrelevant retrievals "
-         "that could mislead the generator."),
+         "Scored per chunk via CoT reasoning then averaged across TOP_K chunks."),
         ("Groundedness", "Generator",
          "RAGAS: Faithfulness | DeepEval: Faithfulness + Hallucination",
          "Is the generated answer grounded in the retrieved context? "
-         "TruLens decomposes the answer into atomic claims and checks each "
-         "against the context. Higher = fewer hallucinations."),
+         "The judge decomposes the answer into claims and checks each against "
+         "the context with chain-of-thought reasoning. Higher = fewer hallucinations."),
         ("Answer Relevance", "End-to-end",
          "RAGAS: Answer Relevancy | DeepEval: AnswerRelevancy",
          "Does the final answer address the original question? "
          "Evaluates end-to-end utility of the RAG response."),
         ("Page Accuracy", "Retriever",
-         "Custom (deterministic, same across all 3 frameworks)",
+         "Custom (deterministic, same across RAGAS / DeepEval / TruLens)",
          "Did the retriever find a chunk from the correct page(s) of the "
          "Basel Framework? N/A for out-of-scope questions."),
     ], start=5):
@@ -783,7 +689,7 @@ def build_report(results: list, output_path: str):
 
     ws.column_dimensions["A"].width = 22
     ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["C"].width = 48
+    ws.column_dimensions["C"].width = 50
     ws.column_dimensions["D"].width = 60
 
     # Aggregate scores
@@ -791,14 +697,12 @@ def build_report(results: list, output_path: str):
     write_title(ws, 10, "Aggregate scores (mean across all questions)",
                 "A10:H10", bg=MID_BLUE, size=10)
 
-    agg_metrics = [
-        ("Context\nRelevance ↑",  "context_relevance"),
-        ("Groundedness ↑",        "groundedness"),
-        ("Answer\nRelevance ↑",   "answer_relevance"),
-        ("Page\nAccuracy ↑",      "page_accuracy"),
-    ]
-
-    for ci, (label, key) in enumerate(agg_metrics, start=1):
+    for ci, (label, key) in enumerate([
+        ("Context\nRelevance ↑", "context_relevance"),
+        ("Groundedness ↑",       "groundedness"),
+        ("Answer\nRelevance ↑",  "answer_relevance"),
+        ("Page\nAccuracy ↑",     "page_accuracy"),
+    ], start=1):
         vals = [r[key] for r in results if r.get(key) is not None]
         avg  = round(sum(vals) / len(vals), 3) if vals else None
         bg, fg = _score_color(avg)
@@ -815,35 +719,33 @@ def build_report(results: list, output_path: str):
         ws.row_dimensions[12].height = 40
         ws.column_dimensions[get_column_letter(ci)].width = 20
 
-    # Framework comparison note
+    # Framework comparison
     ws.row_dimensions[13].height = 10
-    write_title(ws, 14, "TruLens vs RAGAS vs DeepEval — key architectural difference",
+    write_title(ws, 14, "TruLens vs RAGAS vs DeepEval — key difference",
                 "A14:H14", bg=MID_BLUE, size=10)
-    for ri, (fw, feature) in enumerate([
-        ("RAGAS",    "Free-form LLM prompt → parse number. No execution tracing."),
-        ("DeepEval", "Pydantic JSON output → typed score + reason. No execution tracing."),
-        ("TruLens",  "OpenTelemetry tracing of every step (retrieve → generate) stored in "
-                     "trulens.db. Scores AND full traces. Launch dashboard: "
-                     "python -c \"from trulens.dashboard import run_dashboard; run_dashboard()\""),
+    for ri, (fw, note) in enumerate([
+        ("RAGAS",    "Free-form LLM prompt → parse number from text. No CoT. No tracing."),
+        ("DeepEval", "Pydantic JSON output → typed score + reason. No tracing."),
+        ("TruLens",  "LiteLLM CoT reasoning → score + step-by-step explanation. "
+                     "Same judge LLM, most interpretable output of the three frameworks."),
     ], start=15):
         fc = ws.cell(row=ri, column=1, value=fw)
-        dc = ws.cell(row=ri, column=2, value=feature)
+        dc = ws.cell(row=ri, column=2, value=note)
         ws.merge_cells(f"B{ri}:H{ri}")
         fc.font = _font(bold=True, size=9)
         dc.font = _font(size=9)
         for c in (fc, dc):
-            c.fill      = _fill(LIGHT_BLUE if ri % 2 == 0 else WHITE)
-            c.border    = _border()
-            c.alignment = _align(wrap=True, v="center")
-        ws.row_dimensions[ri].height = 36
+            c.fill = _fill(LIGHT_BLUE if ri % 2 == 0 else WHITE)
+            c.border = _border(); c.alignment = _align(wrap=True, v="center")
+        ws.row_dimensions[ri].height = 30
 
     # Score guide
     ws.row_dimensions[18].height = 10
-    write_title(ws, 19, "Score interpretation (all TruLens metrics: higher = better)",
+    write_title(ws, 19, "Score interpretation (all metrics: higher = better)",
                 "A19:H19", bg=MID_BLUE, size=10)
     for ri, (rng, label, bg, fg, advice) in enumerate([
         (">=0.75", "Good",  GREEN, GREEN_FONT, "Performing well."),
-        ("0.40-0.74", "Fair", AMBER, AMBER_FONT, "Acceptable, investigate failures."),
+        ("0.40-0.74", "Fair", AMBER, AMBER_FONT, "Acceptable, investigate failures via Reasons sheet."),
         ("<0.40",  "Poor",  RED,   RED_FONT,   "Systematic issue — check CHUNK_SIZE, TOP_K, or embedding model."),
     ], start=20):
         rc = ws.cell(row=ri, column=1, value=rng)
@@ -901,25 +803,24 @@ def build_report(results: list, output_path: str):
                 c.fill = _fill(row_bg)
         ws2.row_dimensions[ri].height = 60
 
-    # ── Sheet 3: Reasons ─────────────────────────────────────────────────────
+    # ── Sheet 3: Reasons (CoT explanations) ──────────────────────────────────
     ws3 = wb.create_sheet("Reasons")
     ws3.merge_cells("A1:D1")
-    ws3["A1"].value     = "TruLens — LLM judge chain-of-thought reasoning for every score"
+    ws3["A1"].value     = "TruLens — Chain-of-Thought reasoning for every score"
     ws3["A1"].font      = _font(bold=True, color=WHITE, size=11)
     ws3["A1"].fill      = _fill(DARK_BLUE)
     ws3["A1"].alignment = _align(h="center", wrap=False)
     ws3.row_dimensions[1].height = 22
 
-    r_headers = ["Question", "Context Relevance Reason",
-                 "Groundedness Reason", "Answer Relevance Reason"]
-    r_keys    = ["context_relevance", "groundedness", "answer_relevance"]
-    r_widths  = [38, 50, 50, 50]
-
-    for ci, (h, w) in enumerate(zip(r_headers, r_widths), start=1):
+    for ci, (h, w) in enumerate(zip(
+        ["Question", "Context Relevance Reasoning",
+         "Groundedness Reasoning", "Answer Relevance Reasoning"],
+        [38, 55, 55, 55]
+    ), start=1):
         c = ws3.cell(row=2, column=ci, value=h)
         c.font = _font(bold=True, color=WHITE, size=9)
-        c.fill = _fill(MID_BLUE)
-        c.alignment = _align(h="center", wrap=True); c.border = _border()
+        c.fill = _fill(MID_BLUE); c.border = _border()
+        c.alignment = _align(h="center", wrap=True)
         ws3.column_dimensions[get_column_letter(ci)].width = w
     ws3.row_dimensions[2].height = 20
     ws3.freeze_panes = "A3"
@@ -929,17 +830,19 @@ def build_report(results: list, output_path: str):
         c = ws3.cell(row=ri, column=1, value=result["question"])
         c.fill = _fill(row_bg); c.border = _border()
         c.alignment = _align(wrap=True); c.font = _font(size=9)
-        for ci, key in enumerate(r_keys, start=2):
+        for ci, key in enumerate(
+            ["context_relevance", "groundedness", "answer_relevance"], start=2
+        ):
             c = ws3.cell(row=ri, column=ci,
                          value=result.get("reasons", {}).get(key, "N/A"))
             c.font = _font(size=9); c.fill = _fill(row_bg)
             c.border = _border(); c.alignment = _align(wrap=True)
-        ws3.row_dimensions[ri].height = 90
+        ws3.row_dimensions[ri].height = 100
 
     # ── Sheet 4: Answers ─────────────────────────────────────────────────────
     ws4 = wb.create_sheet("Answers")
     ws4.merge_cells("A1:D1")
-    ws4["A1"].value     = "Generated answers + expected outputs for qualitative review"
+    ws4["A1"].value     = "Generated answers vs expected outputs — qualitative review"
     ws4["A1"].font      = _font(bold=True, color=WHITE, size=11)
     ws4["A1"].fill      = _fill(DARK_BLUE)
     ws4["A1"].alignment = _align(h="center", wrap=False)
@@ -982,9 +885,9 @@ def build_report(results: list, output_path: str):
         ("SCORE_THRESHOLD",   SCORE_THRESHOLD),
         ("RRF_K",             RRF_K),
         ("Questions",         len(results)),
-        ("Ollama endpoint",   "/api/embed  (>= 0.2)"),
+        ("Ollama endpoint",   "/api/embed (Ollama >= 0.2)"),
+        ("TruLens version",   "2.8.1"),
         ("Framework",         "TruLens (Snowflake)"),
-        ("Dashboard",         "python -c \"from trulens.dashboard import run_dashboard; run_dashboard()\""),
         ("Run timestamp",     datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
     ], start=1):
         ck = ws5.cell(row=ri, column=1, value=k)
@@ -999,7 +902,7 @@ def build_report(results: list, output_path: str):
         for c in (ck, cv):
             c.border = _border(); c.alignment = _align(wrap=False)
     ws5.column_dimensions["A"].width = 22
-    ws5.column_dimensions["B"].width = 70
+    ws5.column_dimensions["B"].width = 55
 
     wb.save(output_path)
     print(f"\n  Report saved → {output_path}")
@@ -1010,20 +913,17 @@ def build_report(results: list, output_path: str):
 def main():
     print("\n=== RAG Evaluation — TruLens RAG Triad (5-step scientific method) ===\n")
 
-    # 1. OBSERVATION
     print("STEP 1 — OBSERVATION")
     print("  LLMs hallucinate on unseen regulatory documents.")
     print("  Our hybrid RAG over the Basel Framework should reduce this.")
-    print("  TruLens verifies with the RAG Triad + OpenTelemetry tracing.\n")
+    print("  TruLens verifies with the RAG Triad + CoT reasoning per score.\n")
 
-    # 2. HYPOTHESIS
     print("STEP 2 — HYPOTHESIS")
     print(f"  RAG   : {GEN_MODEL} + {EMBED_MODEL}, TOP_K={TOP_K}, RRF_K={RRF_K}")
     print(f"  Judge : LiteLLM → ollama/{GEN_MODEL} — fully local, no OpenAI key")
     print(f"  Triad : Context Relevance ↑  Groundedness ↑  Answer Relevance ↑")
-    print(f"  Unique: Full OpenTelemetry traces stored in trulens.db\n")
+    print(f"  CoT   : Judge explains reasoning before assigning each score\n")
 
-    # 3. EXPERIMENT — setup
     print("STEP 3 — EXPERIMENT")
     print(f"  [1/3] Loading documents from '{DOCS_DIR}'...")
     docs = load_documents(DOCS_DIR)
@@ -1083,7 +983,6 @@ def main():
             "elapsed_s":     elapsed,
         })
 
-    # 4. ANALYSIS
     print("\nSTEP 4 — ANALYSIS\n")
     def mean(key):
         vals = [r[key] for r in results if r.get(key) is not None]
@@ -1102,15 +1001,12 @@ def main():
         tag = "GOOD" if val >= 0.75 else "FAIR" if val >= 0.40 else "POOR"
         print(f"  {label}: {val:.3f}  [{tag}]")
 
-    # 5. CONCLUSION
     print("\nSTEP 5 — CONCLUSION")
     ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"trulens_report_{ts}.xlsx"
     build_report(results, output_path)
-    print("  Open 'Reasons' sheet for chain-of-thought explanations per score.")
-    print("  Open 'Answers' sheet to compare generated vs expected outputs.")
-    print("  Launch the TruLens dashboard to explore full execution traces:")
-    print("    python -c \"from trulens.dashboard import run_dashboard; run_dashboard()\"\n")
+    print("  Open 'Reasons' sheet for CoT explanations per score.")
+    print("  Open 'Answers' sheet to compare generated vs expected outputs.\n")
 
 
 if __name__ == "__main__":
