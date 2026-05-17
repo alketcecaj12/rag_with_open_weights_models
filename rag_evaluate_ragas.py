@@ -47,14 +47,14 @@ nltk.download("punkt_tab", quiet=True)
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 OLLAMA_URL        = "http://localhost:11434"
-GEN_MODEL         = "llama3.2"
+GEN_MODEL         = "phi3:mini"
 EMBED_MODEL       = "mxbai-embed-large"
 DOCS_DIR          = "./docs"
 CHROMA_DIR        = "./chroma_store"
 COLLECTION        = "rag_knowledge"
-CHUNK_SIZE        = 1000
-CHUNK_OVERLAP     = 150
-TOP_K             = 3
+CHUNK_SIZE        = 1500
+CHUNK_OVERLAP     = 300
+TOP_K             = 7
 SCORE_THRESHOLD   = 0.40
 RRF_K             = 60
 GROUND_TRUTH_FILE = "ground_truth.json"
